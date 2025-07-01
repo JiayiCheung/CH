@@ -21,4 +21,11 @@ tier_params:
     r_scale: 2.0
 
 # 训练参数
-vessel_weight:
+vessel_weight: 15.0
+tumor_weight: 18.0
+use_boundary: true
+weight_decay: 5e-6
+
+# 推理参数
+window_size: 48
+overlap: 0.65
