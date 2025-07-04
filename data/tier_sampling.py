@@ -3,10 +3,15 @@ from scipy import ndimage
 from scipy.ndimage import zoom
 from skimage import morphology
 import random
+import logging
+from .importance_sampler import ImportanceSampler
+from .complexity_analyzer import ComplexityAnalyzer
+
+logger = logging.getLogger(__name__)
 
 
 class TierSampler:
-	"""实现三级采样策略"""
+	"""实现三级采样策略，支持智能采样"""
 	
 	def __init__(self, tier0_size=256, tier1_size=96, tier2_size=64,
 	             max_tier1=10, max_tier2=30):
@@ -25,8 +30,31 @@ class TierSampler:
 		self.tier2_size = tier2_size
 		self.max_tier1 = max_tier1
 		self.max_tier2 = max_tier2
+		
+		# 初始化智能采样组件
+		self.importance_sampler = ImportanceSampler()
+		self.complexity_analyzer = ComplexityAnalyzer()
+		
+		# 初始化采样参数
+		self.sampling_params = {
+			'tier1_samples': max_tier1,
+			'tier2_samples': max_tier2,
+			'hard_mining_weight': 0.0,
+			'importance_weight': 0.0
+		}
 	
-	def sample(self, image_data, label_data, liver_mask=None):
+	def set_sampling_params(self, params):
+		"""
+		设置采样参数
+
+		参数:
+			params: 采样参数字典
+		"""
+		self.sampling_params.update(params)
+		logger.debug(f"Updated sampling params: {self.sampling_params}")
+	
+	def sample(self, image_data, label_data, liver_mask=None,
+	           difficulty_map=None, case_id=None):
 		"""
 		执行三级采样
 
@@ -34,28 +62,56 @@ class TierSampler:
 			image_data: 输入图像数据
 			label_data: 输入标签数据
 			liver_mask: 肝脏掩码（可选）
+			difficulty_map: 难度图（可选）
+			case_id: 案例ID（可选）
 
 		返回:
 			采样块列表，每个元素为包含tier、image和label的字典
 		"""
-		# 调用三级采样函数
-		return self.three_tier_patch_sampling(
+		# 计算案例复杂度
+		if label_data is not None:
+			complexity = self.complexity_analyzer.compute_complexity(label_data)
+		else:
+			complexity = 1.0
+		
+		# 应用复杂度调整采样数量
+		tier1_samples = self.sampling_params['tier1_samples']
+		tier2_samples = self.sampling_params['tier2_samples']
+		
+		if self.sampling_params.get('enable_adaptive_density', True):
+			adjusted = self.complexity_analyzer.adjust_sampling_density(
+				complexity, tier1_samples, tier2_samples
+			)
+			tier1_samples, tier2_samples = adjusted
+		
+		# 应用采样参数
+		max_tier1 = tier1_samples
+		max_tier2 = tier2_samples
+		
+		# 调用增强版三级采样函数
+		return self.enhanced_three_tier_sampling(
 			image_data, label_data, liver_mask,
 			self.tier0_size, self.tier1_size, self.tier2_size,
-			self.max_tier1, self.max_tier2
+			max_tier1, max_tier2,
+			difficulty_map=difficulty_map,
+			importance_weight=self.sampling_params.get('importance_weight', 0.0),
+			hard_mining_weight=self.sampling_params.get('hard_mining_weight', 0.0)
 		)
 	
-	def three_tier_patch_sampling(self, image_data, label_data, liver_mask=None,
-	                              tier0_size=256, tier1_size=96, tier2_size=64,
-	                              max_tier1=10, max_tier2=30):
+	def enhanced_three_tier_sampling(self, image_data, label_data, liver_mask=None,
+	                                 tier0_size=256, tier1_size=96, tier2_size=64,
+	                                 max_tier1=10, max_tier2=30,
+	                                 difficulty_map=None,
+	                                 importance_weight=0.0,
+	                                 hard_mining_weight=0.0):
 		"""
-		三级采样: Tier-0 (整个肝脏), Tier-1 (大型结构), Tier-2 (细微血管/肿瘤)
+		增强版三级采样: 支持重要性采样和硬样本挖掘
 
 		返回包含图像和血管/肿瘤掩码的采样块列表
 		"""
 		patches = []
 		
-		# ---- TIER-0: 器官级别采样块 (仅1个，覆盖整个肝脏) ----
+		# ---- TIER-0: 器官级别采样块 (保持不变) ----
 		if liver_mask is None:
 			# 如果没有提供肝脏掩码，使用所有标签>0的区域
 			liver_mask = (label_data > 0).astype(np.uint8)
@@ -78,32 +134,76 @@ class TierSampler:
 		lbl0 = zoom(lbl0, [tier0_size / s for s in lbl0.shape], order=0)
 		patches.append({'tier': 0, 'image': img0, 'label': lbl0})
 		
-		# ---- TIER-1: 结构级别 (粗结构，大血管，小肿瘤) ----
-		# 在骨架或大血管处设置点，均匀采样max_tier1个
+		# ---- TIER-1: 结构级别 (智能采样增强) ----
 		foreground_mask = (label_data > 0)
-		if np.sum(foreground_mask) > 0 and np.sum(foreground_mask) < 1000:  # 前景太稀疏
-			print(f"前景过于稀疏({np.sum(foreground_mask)}个体素)，进行膨胀操作")
-			foreground_mask = morphology.binary_dilation(foreground_mask, morphology.ball(2))
-			print(f"膨胀后前景体素数: {np.sum(foreground_mask)}")
 		
-		print(f"前景掩码体素数: {np.sum(foreground_mask)}")
+		# 处理前景稀疏情况
+		if np.sum(foreground_mask) > 0 and np.sum(foreground_mask) < 1000:  # 前景太稀疏
+			logger.info(f"前景过于稀疏({np.sum(foreground_mask)}个体素)，进行膨胀操作")
+			foreground_mask = morphology.binary_dilation(foreground_mask, morphology.ball(2))
+			logger.info(f"膨胀后前景体素数: {np.sum(foreground_mask)}")
+		
+		logger.info(f"前景掩码体素数: {np.sum(foreground_mask)}")
+		
+		# 提取骨架或使用前景点
 		if np.sum(foreground_mask) < 500:  # 前景太稀疏
-			# 直接使用前景点而不是骨架
 			points = np.array(np.where(foreground_mask)).T
-			print(f"前景过于稀疏，跳过骨架化，直接使用所有前景点: {len(points)}个")
+			logger.info(f"前景过于稀疏，跳过骨架化，直接使用所有前景点: {len(points)}个")
 		else:
 			# 尝试骨架化
 			skeleton = morphology.skeletonize(foreground_mask)
 			points = np.array(np.where(skeleton)).T
-			print(f"骨架化后得到点数: {len(points)}")
+			logger.info(f"骨架化后得到点数: {len(points)}")
 			if len(points) == 0:
 				points = np.array(np.where(foreground_mask)).T
-				print(f"骨架为空，使用前景点: {len(points)}个")
+				logger.info(f"骨架为空，使用前景点: {len(points)}个")
+		
 		if len(points) == 0:
 			points = np.array(np.where(foreground_mask)).T
-		if len(points) > max_tier1:
-			sel_idx = np.linspace(0, len(points) - 1, max_tier1).astype(int)
-			points = points[sel_idx]
+		
+		# 应用智能采样 (如果启用)
+		if importance_weight > 0 and len(points) > 0:
+			# 计算重要性图
+			importance_map = self.importance_sampler.compute_importance_map(
+				label_data, difficulty_map
+			)
+			
+			# 获取点的重要性值
+			importance_values = np.array([
+				importance_map[tuple(pt)] for pt in points
+			])
+			
+			# 如果有难度图，结合难度信息
+			if difficulty_map is not None and hard_mining_weight > 0:
+				difficulty_values = np.array([
+					difficulty_map[tuple(pt)] for pt in points
+				])
+				
+				# 结合重要性和难度
+				combined_weights = (
+						(1 - hard_mining_weight - importance_weight) * 0.5 +  # 均匀采样
+						importance_weight * importance_values +  # 重要性
+						hard_mining_weight * difficulty_values  # 难度
+				)
+			else:
+				# 只使用重要性
+				combined_weights = (
+						(1 - importance_weight) * 0.5 +  # 均匀采样
+						importance_weight * importance_values  # 重要性
+				)
+			
+			# 智能采样
+			if len(points) > max_tier1:
+				points = self.importance_sampler.importance_based_sampling(
+					points, combined_weights, max_tier1
+				)
+		else:
+			# 原始均匀采样
+			if len(points) > max_tier1:
+				sel_idx = np.linspace(0, len(points) - 1, max_tier1).astype(int)
+				points = points[sel_idx]
+		
+		# 提取Tier-1块
 		for pt in points:
 			c = pt
 			slices = tuple(
@@ -118,8 +218,8 @@ class TierSampler:
 				lbl1 = zoom(lbl1, [tier1_size / s for s in lbl1.shape], order=0)
 			patches.append({'tier': 1, 'image': img1, 'label': lbl1})
 		
-		# ---- TIER-2: 细节级别 (最细微血管/肿瘤边界) ----
-		# 腐蚀血管掩码提取直径2-4的细微血管
+		# ---- TIER-2: 细节级别 (智能采样增强) ----
+		# 提取细微结构
 		vessel_mask = (label_data > 0.5) & (label_data < 1.5)
 		tumor_mask = (label_data > 1.5) & (label_data < 2.5)
 		detail_mask = vessel_mask | tumor_mask
@@ -127,10 +227,51 @@ class TierSampler:
 		thin_mask = (dist_map > 0) & (dist_map <= 5)
 		skel_detail = morphology.skeletonize(thin_mask)
 		detail_points = np.array(np.where(skel_detail)).T
-		# 随机选择max_tier2个点
-		if len(detail_points) > max_tier2:
-			idx = np.random.choice(len(detail_points), max_tier2, replace=False)
-			detail_points = detail_points[idx]
+		
+		# 应用智能采样 (如果启用)
+		if importance_weight > 0 and len(detail_points) > 0:
+			# 计算重要性图 (如果Tier-1未计算)
+			if 'importance_map' not in locals():
+				importance_map = self.importance_sampler.compute_importance_map(
+					label_data, difficulty_map
+				)
+			
+			# 获取点的重要性值
+			importance_values = np.array([
+				importance_map[tuple(pt)] for pt in detail_points
+			])
+			
+			# 如果有难度图，结合难度信息
+			if difficulty_map is not None and hard_mining_weight > 0:
+				difficulty_values = np.array([
+					difficulty_map[tuple(pt)] for pt in detail_points
+				])
+				
+				# 结合重要性和难度
+				combined_weights = (
+						(1 - hard_mining_weight - importance_weight) * 0.5 +  # 均匀采样
+						importance_weight * importance_values +  # 重要性
+						hard_mining_weight * difficulty_values  # 难度
+				)
+			else:
+				# 只使用重要性
+				combined_weights = (
+						(1 - importance_weight) * 0.5 +  # 均匀采样
+						importance_weight * importance_values  # 重要性
+				)
+			
+			# 智能采样
+			if len(detail_points) > max_tier2:
+				detail_points = self.importance_sampler.importance_based_sampling(
+					detail_points, combined_weights, max_tier2
+				)
+		else:
+			# 原始随机采样
+			if len(detail_points) > max_tier2:
+				idx = np.random.choice(len(detail_points), max_tier2, replace=False)
+				detail_points = detail_points[idx]
+		
+		# 提取Tier-2块
 		for pt in detail_points:
 			c = pt
 			slices = tuple(

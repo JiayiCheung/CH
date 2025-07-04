@@ -39,3 +39,17 @@ weight_decay: 1e-5
 # 推理参数
 window_size: 64
 overlap: 0.5
+
+# 添加以下部分到配置文件
+
+# 智能采样参数
+smart_sampling:
+  enabled: true
+  warmup_epochs: 5
+  base_tier1: 10
+  base_tier2: 30
+  max_tier1: 20
+  max_tier2: 60
+  enable_hard_mining: true
+  enable_adaptive_density: true
+  enable_importance_sampling: true

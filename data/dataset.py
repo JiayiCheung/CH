@@ -2,19 +2,27 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 import nibabel as nib
-from pathlib import Path
 import random
 from tqdm import tqdm
+import logging
+from pathlib import Path
 
-from .preprocessing import CTPreprocessor
+from .processing import CTPreprocessor
 from .tier_sampling import TierSampler
+from .hard_sample_tracker import HardSampleTracker
+from utils.sampling_scheduler import SamplingScheduler
 
 
+
+
+# 修改 LiverVesselDataset 类
 class LiverVesselDataset(Dataset):
-	"""肝脏血管分割数据集"""
+	"""肝脏血管分割数据集，支持智能采样和硬样本挖掘"""
 	
 	def __init__(self, image_dir, label_dir, tier=None, transform=None,
-	             preprocess=True, max_cases=None, random_sampling=True):
+	             preprocess=True, max_cases=None, random_sampling=True,
+	             enable_smart_sampling=True, sampling_scheduler=None,
+	             hard_sample_tracker=None, difficulty_maps_dir="difficulty_maps"):
 		"""
 		初始化数据集
 
@@ -26,19 +34,34 @@ class LiverVesselDataset(Dataset):
 			preprocess: 是否进行预处理
 			max_cases: 最大加载病例数
 			random_sampling: 是否随机采样病例
+			enable_smart_sampling: 是否启用智能采样
+			sampling_scheduler: 采样调度器
+			hard_sample_tracker: 硬样本跟踪器
+			difficulty_maps_dir: 难度图目录
 		"""
 		self.image_dir = Path(image_dir)
 		self.label_dir = Path(label_dir)
 		self.tier = tier
 		self.transform = transform
 		self.preprocess = preprocess
+		self.enable_smart_sampling = enable_smart_sampling
 		
 		# 初始化预处理器和采样器
 		self.preprocessor = CTPreprocessor() if preprocess else None
 		self.sampler = TierSampler()
 		
+		# 设置采样调度器
+		self.sampling_scheduler = sampling_scheduler
+		if sampling_scheduler is None and enable_smart_sampling:
+			self.sampling_scheduler = SamplingScheduler()
+		
+		# 设置硬样本跟踪器
+		self.hard_sample_tracker = hard_sample_tracker
+		if hard_sample_tracker is None and enable_smart_sampling:
+			self.hard_sample_tracker = HardSampleTracker(difficulty_maps_dir)
+		
 		# 加载数据
-		self.patches = self._load_data(max_cases, random_sampling)
+		self.patches, self.case_patches = self._load_data(max_cases, random_sampling)
 	
 	def _load_data(self, max_cases, random_sampling):
 		"""加载数据，应用三级采样"""
@@ -51,6 +74,8 @@ class LiverVesselDataset(Dataset):
 			selected_cases = image_files[:max_cases] if max_cases else image_files
 		
 		all_patches = []
+		case_patches = {}  # 记录每个案例的patches
+		
 		for image_path in tqdm(selected_cases, desc="Loading cases"):
 			case_id = image_path.stem
 			
@@ -75,10 +100,30 @@ class LiverVesselDataset(Dataset):
 			else:
 				liver_mask = None
 			
-			# 应用三级采样
-			patch_list = self.sampler.sample(image_data, label_data, liver_mask)
+			# 获取难度图(如果启用智能采样)
+			difficulty_map = None
+			if self.enable_smart_sampling and self.hard_sample_tracker is not None:
+				# 初始化难度图
+				if case_id not in self.hard_sample_tracker.case_dims:
+					self.hard_sample_tracker.initialize_case(case_id, label_data.shape)
+				
+				# 获取难度图
+				difficulty_map = self.hard_sample_tracker.get_difficulty_map(case_id)
 			
-			# 添加病例ID
+			# 设置采样参数
+			if self.enable_smart_sampling and self.sampling_scheduler is not None:
+				# 获取采样参数
+				sampling_params = self.sampling_scheduler.get_tier_sampling_params()
+				# 设置到采样器
+				self.sampler.set_sampling_params(sampling_params)
+			
+			# 应用三级采样
+			patch_list = self.sampler.sample(
+				image_data, label_data, liver_mask,
+				difficulty_map=difficulty_map, case_id=case_id
+			)
+			
+			# 添加案例ID
 			for patch in patch_list:
 				patch['id'] = case_id
 			
@@ -87,6 +132,7 @@ class LiverVesselDataset(Dataset):
 				patch_list = [p for p in patch_list if p['tier'] == self.tier]
 			
 			all_patches.extend(patch_list)
+			case_patches[case_id] = patch_list
 			
 			# 打印统计信息
 			tier_counts = {}
@@ -99,7 +145,52 @@ class LiverVesselDataset(Dataset):
 			      f"tier2:{tier_counts.get(2, 0)})")
 		
 		print(f"Total patches: {len(all_patches)}")
-		return all_patches
+		return all_patches, case_patches
+	
+	def update_difficulty_maps(self, model, device):
+		"""
+		使用当前模型更新难度图
+
+		参数:
+			model: 当前模型
+			device: 计算设备
+		"""
+		if not self.enable_smart_sampling or self.hard_sample_tracker is None:
+			return
+		
+		logger.info("Updating difficulty maps...")
+		
+		# 设置模型为评估模式
+		model.eval()
+		
+		with torch.no_grad():
+			for case_id, patches in self.case_patches.items():
+				# 只处理有足够多patches的案例
+				if len(patches) < 5:
+					continue
+				
+				# 获取Tier-0 patch (全局视图)
+				tier0_patches = [p for p in patches if p['tier'] == 0]
+				if not tier0_patches:
+					continue
+				
+				# 使用Tier-0进行预测
+				patch = tier0_patches[0]
+				image = torch.from_numpy(patch['image']).float().unsqueeze(0).unsqueeze(0).to(device)
+				label = torch.from_numpy(patch['label']).float().to(device)
+				
+				# 设置tier
+				model.set_tier(0)
+				
+				# 前向传播
+				pred = model(image)
+				
+				# 更新难度图
+				self.hard_sample_tracker.update_difficulty(case_id, pred.squeeze(), label)
+		
+		# 同步难度图到磁盘
+		self.hard_sample_tracker.sync_difficulty_maps()
+		logger.info("Difficulty maps updated")
 	
 	def __len__(self):
 		"""返回数据集大小"""
