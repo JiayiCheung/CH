@@ -1,19 +1,13 @@
-"""
-重要性采样模块，用于智能采样关键血管区域
-"""
 import numpy as np
 from scipy import ndimage
 from skimage import morphology, measure
-import logging
-
-logger = logging.getLogger(__name__)
 
 class ImportanceSampler:
     """血管重要性采样器"""
     
-    def __init__(self):
+    def __init__(self, logger=None):
         """初始化重要性采样器"""
-        pass
+        self.logger = logger
     
     def compute_importance_map(self, label_data, difficulty_map=None):
         """
@@ -41,7 +35,8 @@ class ImportanceSampler:
         try:
             skeleton = morphology.skeletonize(binary_mask)
         except Exception as e:
-            logger.warning(f"Error skeletonizing: {e}")
+            if self.logger:
+                self.logger.log_warning(f"Error skeletonizing: {e}")
             # 如果骨架提取失败，使用原始掩码
             skeleton = binary_mask
         
@@ -53,7 +48,8 @@ class ImportanceSampler:
             branch_map = ndimage.distance_transform_edt(~branch_points)
             branch_map = np.exp(-branch_map / 5.0)  # 指数衰减
         except Exception as e:
-            logger.warning(f"Error computing branch importance: {e}")
+            if self.logger:
+                self.logger.log_warning(f"Error computing branch importance: {e}")
         
         # 3. 计算曲率重要性
         curvature_map = np.zeros_like(importance_map)
@@ -68,7 +64,8 @@ class ImportanceSampler:
             # 加权曲率
             curvature_map = curvature_map * np.maximum(curvature_norm, 0.2)
         except Exception as e:
-            logger.warning(f"Error computing curvature importance: {e}")
+            if self.logger:
+                self.logger.log_warning(f"Error computing curvature importance: {e}")
         
         # 4. 计算半径变化重要性
         radius_map = np.zeros_like(importance_map)
@@ -89,7 +86,8 @@ class ImportanceSampler:
             # 加权半径梯度
             radius_map = radius_map * np.maximum(radius_norm, 0.2)
         except Exception as e:
-            logger.warning(f"Error computing radius importance: {e}")
+            if self.logger:
+                self.logger.log_warning(f"Error computing radius importance: {e}")
         
         # 5. 集成几何特征
         # 权重分配: 分支点 40%, 曲率 30%, 半径变化 30%
@@ -284,9 +282,11 @@ class ImportanceSampler:
                             if len(orig_idx) > 0:
                                 curvature[orig_idx[0]] = k
                     except Exception as e:
-                        logger.debug(f"Error computing 2D curvature: {e}")
+                        if self.logger:
+                            self.logger.log_warning(f"Error computing 2D curvature: {e}")
         except Exception as e:
-            logger.warning(f"Error in curvature computation: {e}")
+            if self.logger:
+                self.logger.log_warning(f"Error in curvature computation: {e}")
             # 出错时返回默认曲率
             curvature = np.ones(len(coords))
         
@@ -388,7 +388,8 @@ class ImportanceSampler:
             if max_grad > 0:
                 gradient = gradient / max_grad
         except Exception as e:
-            logger.warning(f"Error computing radius gradient: {e}")
+            if self.logger:
+                self.logger.log_warning(f"Error computing radius gradient: {e}")
         
         return gradient
     
@@ -421,7 +422,8 @@ class ImportanceSampler:
             )
             return coords[indices]
         except Exception as e:
-            logger.warning(f"Error in importance sampling: {e}, using random sampling")
+            if self.logger:
+                self.logger.log_warning(f"Error in importance sampling: {e}, using random sampling")
             # 出错时退化为随机采样
             indices = np.random.choice(len(coords), size=max_samples, replace=False)
             return coords[indices]

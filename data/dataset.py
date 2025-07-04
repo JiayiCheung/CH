@@ -4,7 +4,6 @@ from torch.utils.data import Dataset, DataLoader
 import nibabel as nib
 import random
 from tqdm import tqdm
-import logging
 from pathlib import Path
 
 from .processing import CTPreprocessor
@@ -13,16 +12,14 @@ from .hard_sample_tracker import HardSampleTracker
 from utils.sampling_scheduler import SamplingScheduler
 
 
-
-
-# 修改 LiverVesselDataset 类
 class LiverVesselDataset(Dataset):
 	"""肝脏血管分割数据集，支持智能采样和硬样本挖掘"""
 	
 	def __init__(self, image_dir, label_dir, tier=None, transform=None,
 	             preprocess=True, max_cases=None, random_sampling=True,
 	             enable_smart_sampling=True, sampling_scheduler=None,
-	             hard_sample_tracker=None, difficulty_maps_dir="difficulty_maps"):
+	             hard_sample_tracker=None, difficulty_maps_dir="difficulty_maps",
+	             logger=None):
 		"""
 		初始化数据集
 
@@ -38,6 +35,7 @@ class LiverVesselDataset(Dataset):
 			sampling_scheduler: 采样调度器
 			hard_sample_tracker: 硬样本跟踪器
 			difficulty_maps_dir: 难度图目录
+			logger: 日志记录器实例
 		"""
 		self.image_dir = Path(image_dir)
 		self.label_dir = Path(label_dir)
@@ -45,20 +43,21 @@ class LiverVesselDataset(Dataset):
 		self.transform = transform
 		self.preprocess = preprocess
 		self.enable_smart_sampling = enable_smart_sampling
+		self.logger = logger
 		
 		# 初始化预处理器和采样器
 		self.preprocessor = CTPreprocessor() if preprocess else None
-		self.sampler = TierSampler()
+		self.sampler = TierSampler(logger=logger)
 		
 		# 设置采样调度器
 		self.sampling_scheduler = sampling_scheduler
 		if sampling_scheduler is None and enable_smart_sampling:
-			self.sampling_scheduler = SamplingScheduler()
+			self.sampling_scheduler = SamplingScheduler(logger=logger)
 		
 		# 设置硬样本跟踪器
 		self.hard_sample_tracker = hard_sample_tracker
 		if hard_sample_tracker is None and enable_smart_sampling:
-			self.hard_sample_tracker = HardSampleTracker(difficulty_maps_dir)
+			self.hard_sample_tracker = HardSampleTracker(difficulty_maps_dir, logger=logger)
 		
 		# 加载数据
 		self.patches, self.case_patches = self._load_data(max_cases, random_sampling)
@@ -86,7 +85,10 @@ class LiverVesselDataset(Dataset):
 				if alt_path.exists():
 					label_path = alt_path
 				else:
-					print(f"错误：标签文件不存在，跳过 {case_id}")
+					if self.logger:
+						self.logger.log_warning(f"错误：标签文件不存在，跳过 {case_id}")
+					else:
+						print(f"错误：标签文件不存在，跳过 {case_id}")
 					continue
 			
 			# 加载原始数据
@@ -139,12 +141,21 @@ class LiverVesselDataset(Dataset):
 			for t in range(3):
 				tier_counts[t] = sum(1 for p in patch_list if p['tier'] == t)
 			
-			print(f"Case {case_id}: {len(patch_list)} patches "
-			      f"(tier0:{tier_counts.get(0, 0)}, "
-			      f"tier1:{tier_counts.get(1, 0)}, "
-			      f"tier2:{tier_counts.get(2, 0)})")
+			if self.logger:
+				self.logger.log_info(f"Case {case_id}: {len(patch_list)} patches "
+				                     f"(tier0:{tier_counts.get(0, 0)}, "
+				                     f"tier1:{tier_counts.get(1, 0)}, "
+				                     f"tier2:{tier_counts.get(2, 0)})")
+			else:
+				print(f"Case {case_id}: {len(patch_list)} patches "
+				      f"(tier0:{tier_counts.get(0, 0)}, "
+				      f"tier1:{tier_counts.get(1, 0)}, "
+				      f"tier2:{tier_counts.get(2, 0)})")
 		
-		print(f"Total patches: {len(all_patches)}")
+		if self.logger:
+			self.logger.log_info(f"Total patches: {len(all_patches)}")
+		else:
+			print(f"Total patches: {len(all_patches)}")
 		return all_patches, case_patches
 	
 	def update_difficulty_maps(self, model, device):
@@ -158,7 +169,8 @@ class LiverVesselDataset(Dataset):
 		if not self.enable_smart_sampling or self.hard_sample_tracker is None:
 			return
 		
-		logger.info("Updating difficulty maps...")
+		if self.logger:
+			self.logger.log_info("Updating difficulty maps...")
 		
 		# 设置模型为评估模式
 		model.eval()
@@ -190,7 +202,8 @@ class LiverVesselDataset(Dataset):
 		
 		# 同步难度图到磁盘
 		self.hard_sample_tracker.sync_difficulty_maps()
-		logger.info("Difficulty maps updated")
+		if self.logger:
+			self.logger.log_info("Difficulty maps updated")
 	
 	def __len__(self):
 		"""返回数据集大小"""

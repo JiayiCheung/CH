@@ -2,7 +2,7 @@ from .fft_utils import FFTUtils
 from .cylindrical_mapping import CylindricalMapping
 from .ch_transform import CHTransform
 from .ch_attention import CHAttention
-
+import torch.nn as nn
 
 class CHBranch(nn.Module):
 	"""柱谐波支路的完整实现"""
@@ -83,8 +83,5 @@ class CHBranch(nn.Module):
 		output = self.fft_utils.ifft3d(reconstructed_spectrum, output_shape=x.shape[2:])
 		
 		return output
-
-
-import torch.nn as nn
 
 __all__ = ['FFTUtils', 'CylindricalMapping', 'CHTransform', 'CHAttention', 'CHBranch']

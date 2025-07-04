@@ -1,21 +1,15 @@
-import os
 import argparse
-import yaml
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-import numpy as np
-from pathlib import Path
-from tqdm import tqdm
-import sys
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-from utils.sampling_scheduler import SamplingScheduler
-from data.hard_sample_tracker import HardSampleTracker
 import logging
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.optim as optim
+import yaml
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,15 +17,15 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data import LiverVesselDataset
 from models import VesselSegmenter
 from losses import VesselSegmentationLoss
-from utils import SegmentationMetrics, Logger, Visualizer
+from utils import SegmentationMetrics, Visualizer
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from utils.logger import Logger
 from utils.sampling_scheduler import SamplingScheduler
 from data.hard_sample_tracker import HardSampleTracker
 
-logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -88,7 +82,6 @@ def set_seed(seed):
 	torch.backends.cudnn.benchmark = False
 
 
-
 def init_distributed(args):
 	"""初始化分布式训练环境"""
 	if args.distributed:
@@ -107,27 +100,11 @@ def init_distributed(args):
 		args.local_rank = args.rank % torch.cuda.device_count()
 		torch.cuda.set_device(args.local_rank)
 		
-		logger.info(f"Initialized distributed training: rank={args.rank}, world_size={args.world_size}")
-	else:
-		args.local_rank = 0
+		print(f"Initialized distributed training: rank={args.rank}, world_size={args.world_size}")
 
 
 # 在train.py中
-def init_distributed_training(args):
-	# 设置分布式训练环境
-	args.distributed = args.world_size > 1 or args.multiprocessing_distributed
-	
-	if args.distributed:
-		if args.dist_url == "env://" and args.rank == -1:
-			args.rank = int(os.environ["RANK"])
-		if args.multiprocessing_distributed:
-			args.rank = args.rank * args.ngpus_per_node + gpu
-		dist.init_process_group(
-			backend=args.dist_backend,
-			init_method=args.dist_url,
-			world_size=args.world_size,
-			rank=args.rank
-		)
+
 
 
 def create_data_loader(dataset, args):
@@ -364,17 +341,16 @@ def main():
 	# 设置设备
 	device = torch.device(f"cuda:{args.local_rank}" if torch.cuda.is_available() else "cpu")
 	
-	# 初始化日志记录器
-	if args.rank == 0:  # 只在主进程记录日志
+	# 初始化日志记录器(只在主进程)
+	logger = None
+	if not args.distributed or args.rank == 0:
 		logger = Logger(output_dir / 'logs',
 		                experiment_name=f"tier_{args.tier}" if args.tier is not None else "all_tiers")
 		logger.log_info(f"Starting training with config: {config}")
 		logger.log_info(f"Using device: {device}")
-	else:
-		logger = None
 	
 	# 初始化可视化器
-	visualizer = Visualizer(output_dir / 'visualizations') if args.rank == 0 else None
+	visualizer = Visualizer(output_dir / 'visualizations') if (not args.distributed or args.rank == 0) else None
 	
 	# 初始化采样调度器
 	sampling_scheduler = None
@@ -389,13 +365,15 @@ def main():
 		sampling_scheduler = SamplingScheduler(
 			base_tier1=config.get('tier1_samples', 10),
 			base_tier2=config.get('tier2_samples', 30),
-			warmup_epochs=args.warmup_epochs
+			warmup_epochs=args.warmup_epochs,
+			logger=logger  # 传递logger
 		)
 		
 		# 初始化硬样本跟踪器
 		hard_sample_tracker = HardSampleTracker(
 			base_dir=args.difficulty_maps_dir,
-			device=device
+			device=device,
+			logger=logger  # 传递logger
 		)
 	
 	# 创建数据集
@@ -409,7 +387,8 @@ def main():
 		random_sampling=config.get('random_sampling', True),
 		enable_smart_sampling=args.smart_sampling,
 		sampling_scheduler=sampling_scheduler,
-		hard_sample_tracker=hard_sample_tracker
+		hard_sample_tracker=hard_sample_tracker,
+		logger=logger
 	)
 	
 	val_dataset = LiverVesselDataset(
@@ -605,31 +584,23 @@ def main():
 		dist.destroy_process_group()
 
 
-
 def distributed_main(rank, args):
 	"""分布式训练入口点"""
 	args.rank = rank
-	
-	# 初始化日志
-	logging.basicConfig(
-		level=logging.INFO if args.rank == 0 else logging.WARNING,
-		format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-	)
+	args.local_rank = rank  # 设置local_rank为当前进程的rank
 	
 	# 调用主函数
 	main()
 
 
-
-
 if __name__ == '__main__':
-	# 设置多进程启动方法 (必须在主程序开始时设置)
+	# 设置多进程启动方法
 	mp.set_start_method('spawn', force=True)
 	
 	# 解析参数
 	args = parse_args()
 	
-	# 如果使用分布式训练
+	# 初始化分布式环境
 	if args.distributed:
 		mp.spawn(distributed_main, args=(args,), nprocs=args.world_size)
 	else:

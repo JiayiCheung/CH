@@ -1,19 +1,13 @@
-"""
-硬样本跟踪模块，用于识别和跟踪难分割区域
-"""
 import numpy as np
 import torch
 import torch.nn.functional as F
-import logging
 from pathlib import Path
 from .mmap_utils import MMapManager
-
-logger = logging.getLogger(__name__)
 
 class HardSampleTracker:
     """硬样本跟踪器，管理和更新难度图"""
     
-    def __init__(self, base_dir="difficulty_maps", alpha=0.7, device='cpu'):
+    def __init__(self, base_dir="difficulty_maps", alpha=0.7, device='cpu', logger=None):
         """
         初始化硬样本跟踪器
         
@@ -21,10 +15,12 @@ class HardSampleTracker:
             base_dir: 存储难度图的目录
             alpha: 历史信息权重 (0-1)
             device: 计算设备
+            logger: 日志记录器实例
         """
-        self.mmap_manager = MMapManager(base_dir)
+        self.mmap_manager = MMapManager(base_dir, logger=logger)
         self.alpha = alpha
         self.device = device
+        self.logger = logger
         
         # 缓存难度图和维度信息
         self.case_dims = {}  # 存储案例的体素维度
@@ -42,7 +38,8 @@ class HardSampleTracker:
         
         # 创建或加载难度图
         self.mmap_manager.create_or_load(case_id, shape, initial_value=0.5)
-        logger.debug(f"Initialized difficulty map for {case_id}, shape: {shape}")
+        if self.logger:
+            self.logger.log_info(f"Initialized difficulty map for {case_id}, shape: {shape}")
     
     def get_difficulty_map(self, case_id):
         """
@@ -55,7 +52,8 @@ class HardSampleTracker:
             难度图数组
         """
         if case_id not in self.case_dims:
-            logger.warning(f"Case {case_id} not initialized")
+            if self.logger:
+                self.logger.log_warning(f"Case {case_id} not initialized")
             return None
         
         # 获取难度图
@@ -80,7 +78,8 @@ class HardSampleTracker:
         # 获取难度图
         difficulty_map = self.get_difficulty_map(case_id)
         if difficulty_map is None:
-            logger.warning(f"Cannot update difficulty for {case_id}: not initialized")
+            if self.logger:
+                self.logger.log_warning(f"Cannot update difficulty for {case_id}: not initialized")
             return None
         
         # 确保张量在同一设备上
@@ -104,8 +103,9 @@ class HardSampleTracker:
         # 同步到磁盘
         self.mmap_manager.sync_to_disk(case_id)
         
-        logger.debug(f"Updated difficulty map for {case_id}, "
-                    f"avg difficulty: {np.mean(difficulty_map):.3f}")
+        if self.logger:
+            self.logger.log_info(f"Updated difficulty map for {case_id}, "
+                        f"avg difficulty: {np.mean(difficulty_map):.3f}")
         
         return difficulty_map
     
@@ -175,7 +175,8 @@ class HardSampleTracker:
             # 使用局部Dice作为性能度量
             performance_map = local_dice
         except Exception as e:
-            logger.warning(f"Error computing local performance: {e}")
+            if self.logger:
+                self.logger.log_warning(f"Error computing local performance: {e}")
             # 出错时使用全局性能
             # 计算全局Dice
             intersection = np.sum(pred_binary * target_binary)
@@ -193,4 +194,5 @@ class HardSampleTracker:
     def close(self):
         """关闭硬样本跟踪器，释放资源"""
         self.mmap_manager.close()
-        logger.debug("Closed hard sample tracker")
+        if self.logger:
+            self.logger.log_info("Closed hard sample tracker")

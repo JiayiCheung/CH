@@ -3,18 +3,15 @@ from scipy import ndimage
 from scipy.ndimage import zoom
 from skimage import morphology
 import random
-import logging
 from .importance_sampler import ImportanceSampler
 from .complexity_analyzer import ComplexityAnalyzer
-
-logger = logging.getLogger(__name__)
 
 
 class TierSampler:
 	"""实现三级采样策略，支持智能采样"""
 	
 	def __init__(self, tier0_size=256, tier1_size=96, tier2_size=64,
-	             max_tier1=10, max_tier2=30):
+	             max_tier1=10, max_tier2=30, logger=None):
 		"""
 		初始化三级采样器
 
@@ -24,16 +21,18 @@ class TierSampler:
 			tier2_size: Tier-2采样块大小
 			max_tier1: Tier-1最大采样数量
 			max_tier2: Tier-2最大采样数量
+			logger: 日志记录器实例
 		"""
 		self.tier0_size = tier0_size
 		self.tier1_size = tier1_size
 		self.tier2_size = tier2_size
 		self.max_tier1 = max_tier1
 		self.max_tier2 = max_tier2
+		self.logger = logger
 		
 		# 初始化智能采样组件
-		self.importance_sampler = ImportanceSampler()
-		self.complexity_analyzer = ComplexityAnalyzer()
+		self.importance_sampler = ImportanceSampler(logger=logger)
+		self.complexity_analyzer = ComplexityAnalyzer(logger=logger)
 		
 		# 初始化采样参数
 		self.sampling_params = {
@@ -51,7 +50,8 @@ class TierSampler:
 			params: 采样参数字典
 		"""
 		self.sampling_params.update(params)
-		logger.debug(f"Updated sampling params: {self.sampling_params}")
+		if self.logger:
+			self.logger.log_info(f"Updated sampling params: {self.sampling_params}")
 	
 	def sample(self, image_data, label_data, liver_mask=None,
 	           difficulty_map=None, case_id=None):
@@ -139,24 +139,30 @@ class TierSampler:
 		
 		# 处理前景稀疏情况
 		if np.sum(foreground_mask) > 0 and np.sum(foreground_mask) < 1000:  # 前景太稀疏
-			logger.info(f"前景过于稀疏({np.sum(foreground_mask)}个体素)，进行膨胀操作")
+			if self.logger:
+				self.logger.log_info(f"前景过于稀疏({np.sum(foreground_mask)}个体素)，进行膨胀操作")
 			foreground_mask = morphology.binary_dilation(foreground_mask, morphology.ball(2))
-			logger.info(f"膨胀后前景体素数: {np.sum(foreground_mask)}")
+			if self.logger:
+				self.logger.log_info(f"膨胀后前景体素数: {np.sum(foreground_mask)}")
 		
-		logger.info(f"前景掩码体素数: {np.sum(foreground_mask)}")
+		if self.logger:
+			self.logger.log_info(f"前景掩码体素数: {np.sum(foreground_mask)}")
 		
 		# 提取骨架或使用前景点
 		if np.sum(foreground_mask) < 500:  # 前景太稀疏
 			points = np.array(np.where(foreground_mask)).T
-			logger.info(f"前景过于稀疏，跳过骨架化，直接使用所有前景点: {len(points)}个")
+			if self.logger:
+				self.logger.log_info(f"前景过于稀疏，跳过骨架化，直接使用所有前景点: {len(points)}个")
 		else:
 			# 尝试骨架化
 			skeleton = morphology.skeletonize(foreground_mask)
 			points = np.array(np.where(skeleton)).T
-			logger.info(f"骨架化后得到点数: {len(points)}")
+			if self.logger:
+				self.logger.log_info(f"骨架化后得到点数: {len(points)}")
 			if len(points) == 0:
 				points = np.array(np.where(foreground_mask)).T
-				logger.info(f"骨架为空，使用前景点: {len(points)}个")
+				if self.logger:
+					self.logger.log_info(f"骨架为空，使用前景点: {len(points)}个")
 		
 		if len(points) == 0:
 			points = np.array(np.where(foreground_mask)).T
