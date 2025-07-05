@@ -144,3 +144,27 @@ class Logger:
 		for handler in self.logger.handlers[:]:
 			handler.close()
 			self.logger.removeHandler(handler)
+	
+	def __getstate__(self):
+		"""控制序列化行为"""
+		# 只保留必要的状态信息，不包含不可序列化的组件
+		return {
+			'log_dir': self.log_dir,
+			'experiment_name': self.experiment_name,
+			'experiment_dir': self.experiment_dir
+		}
+	
+	def __setstate__(self, state):
+		"""控制反序列化行为"""
+		# 恢复基本属性
+		self.__dict__.update(state)
+		
+		# 创建空操作日志函数
+		self.log_info = lambda message: None
+		self.log_warning = lambda message: None
+		self.log_error = lambda message: None
+		self.log_metrics = lambda metrics, step, prefix='': None
+		self.log_parameters = lambda model, step: None
+		self.log_images = lambda images_dict, step: None
+		self.log_model = lambda model, filename='model.pt': None
+		self.close = lambda: None

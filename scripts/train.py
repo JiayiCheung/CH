@@ -47,6 +47,8 @@ def parse_args():
 	parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint for resuming training')
 	
 	# 多GPU参数
+	parser.add_argument('--local_rank', type=int, default=0,
+	                    help='Local rank for distributed training')
 	parser.add_argument('--distributed', action='store_true', help='Enable distributed training')
 	parser.add_argument('--world_size', type=int, default=4, help='Number of GPUs to use')
 	parser.add_argument('--rank', type=int, default=0, help='Node rank for distributed training')
@@ -600,8 +602,10 @@ if __name__ == '__main__':
 	# 解析参数
 	args = parse_args()
 	
-	# 初始化分布式环境
+	# 如果使用分布式训练
 	if args.distributed:
 		mp.spawn(distributed_main, args=(args,), nprocs=args.world_size)
 	else:
+		# 为单GPU模式设置local_rank
+		args.local_rank = 0
 		main()

@@ -30,9 +30,8 @@ python train.py \
   --image_dir /home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/imagesTr \
   --label_dir /home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/labelsTr \
   --output_dir /home/bingxing2/home/scx7as9/run/CSUqx/CH/scripts/vessel_output/test_run \
-  --config configs/default.yaml \
+  --config /home/bingxing2/home/scx7as9/run/CSUqx/CH/configs/default.yaml \
   --batch_size 1 \
   --epochs 10 \
   --lr 1e-4 \
-  --max_cases 3 \
-  --val_interval 1
+  --val_interval 1 --local_rank 0
