@@ -1,53 +1,79 @@
-# 默认配置文件
+# =============================================================================
+# 默认配置文件  （所有实验先读取此文件，再用 tier0_pretrain.yaml 等覆盖差异）
+# =============================================================================
 
-# 数据参数
-max_cases: 10  # 训练使用的最大病例数
-max_val_cases: 5  # 验证使用的最大病例数
-random_sampling: true  # 是否随机抽样
+# -----------------------------------------------------------------------------
+# 数据
+max_cases:        2
+max_val_cases:     1
+random_sampling:  true
 
-# 模型参数
+# -----------------------------------------------------------------------------
+# CH-Branch 参数
 ch_params:
-  max_n: 3  # 最大角谐波阶数
-  max_k: 4  # 最大径向阶数
-  max_l: 5  # 最大轴向阶数
-  cylindrical_dims: [32, 36, 32]  # 柱坐标维度
+  max_n: 3
+  max_k: 4
+  max_l: 5
+  cylindrical_dims: [32, 36, 32]
 
-# Tier特定参数
+# -----------------------------------------------------------------------------
+# Tier-specific 参数
 tier_params:
-  0:  # 器官级别
+  0:
     max_n: 2
     max_k: 3
     max_l: 4
-    r_scale: 1.0  # 明确使用小数点
-  1:  # 结构级别
+    r_scale: 1.0
+  1:
     max_n: 3
     max_k: 4
     max_l: 5
     r_scale: 1.5
-  2:  # 细节级别
+  2:
     max_n: 4
     max_k: 5
     max_l: 6
     r_scale: 2.0
 
-# 训练参数
-vessel_weight: 10.0  # 血管权重
-tumor_weight: 15.0  # 肿瘤权重
-use_boundary: true  # 是否使用边界增强
-weight_decay: 0.00001  # 使用小数表示而非科学计数法(1e-5)
+# -----------------------------------------------------------------------------
+# Optimizer / 训练
+optimizer:                       # ← 新增
+  base_lr:          1.0e-4       # 主干 LR
+  kernel_lr_scale:  0.1          # EdgeEnhancement.kernels = base_lr × 0.1
+  weight_decay:     1.0e-5
 
-# 推理参数
-window_size: 64  # 推理窗口大小
-overlap: 0.5  # 窗口重叠比例
+amp: true                        # ← 新增：是否默认开启混合精度
 
-# 智能采样参数
+# -----------------------------------------------------------------------------
+# 损失相关
+vessel_weight: 10.0
+tumor_weight:  15.0              # 如新版 loss 未用，可保留不影响
+use_boundary:  true
+
+# -----------------------------------------------------------------------------
+# Spatial Branch
+spatial_out_channels: 16         # 若改动 SpatialFeatureExtractor 输出通道在此同步
+
+# -----------------------------------------------------------------------------
+# Edge-Enhancement 模块                         # ← 新增（如暂不用将 use 设 false）
+edge:
+  use: true
+  out_channels: 8
+
+# -----------------------------------------------------------------------------
+# 推理
+window_size: 64
+overlap:     0.5
+
+# -----------------------------------------------------------------------------
+# 智能采样
 smart_sampling:
-  enabled: true  # 是否启用智能采样
-  warmup_epochs: 5  # 预热轮数
-  base_tier1: 10  # 基础Tier-1采样数量
-  base_tier2: 30  # 基础Tier-2采样数量
-  max_tier1: 20  # 最大Tier-1采样数量
-  max_tier2: 60  # 最大Tier-2采样数量
-  enable_hard_mining: true  # 启用硬样本挖掘
-  enable_adaptive_density: true  # 启用自适应密度
-  enable_importance_sampling: true  # 启用重要性采样
+  enabled: true
+  warmup_epochs: 5
+  base_tier1: 10
+  base_tier2: 30
+  max_tier1:  20
+  max_tier2:  60
+  enable_hard_mining:       true
+  enable_adaptive_density:  true
+  enable_importance_sampling: true

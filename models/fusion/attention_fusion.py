@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 from models.complex.utils import magnitude as mag  # 复数→幅值
 from models.complex.utils import apply_real_weight  # 实数权重施加到实/虚
@@ -54,18 +55,21 @@ class AttentionFusion(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.total_c: int | None = None  # 首次 forward 后确定
+        self.total_c: Optional[int] = None
         self.chan_att = ChannelAttention()
         self.spa_att = SpatialAttention()
-        self.fuse_conv: nn.Sequential | None = None  # lazy 构建
+        self.fuse_conv: Optional[nn.Sequential] = None
 
     # ------------------------------------------------------------------
-    def _build_fuse_conv(self, channels: int):
+    def _build_fuse_conv(self, channels: int, ref: torch.Tensor):
+        """channels: 实际通道数; ref: 用于对齐 device / dtype"""
         self.fuse_conv = nn.Sequential(
             nn.Conv3d(channels, channels, 3, padding=1, bias=False),
             nn.InstanceNorm3d(channels),
             nn.ReLU(inplace=True),
         )
+        
+        self.fuse_conv.to(ref.device, dtype=ref.dtype)
 
     # ------------------------------------------------------------------
     def forward(self, ch_feat: torch.Tensor, sp_feat: torch.Tensor) -> torch.Tensor:
@@ -78,7 +82,7 @@ class AttentionFusion(nn.Module):
         # 首次前向：根据实际通道构建融合卷积
         if self.total_c is None:
             self.total_c = x.shape[1]
-            self._build_fuse_conv(self.total_c)
+            self._build_fuse_conv(self.total_c, x)
         assert self.fuse_conv is not None  # mypy guard
 
         # Channel attention

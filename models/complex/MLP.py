@@ -24,16 +24,17 @@ class ChannelMLP(nn.Module):
         self.net: nn.Sequential | None = None  # lazy
 
     # ------------------------------------------------------------------
-    def _build(self, channels: int):
+    def _build(self, channels: int, ref: torch.Tensor):
         hidden = max(8, channels // self.reduction_ratio)
         self.net = nn.Sequential(
             nn.Conv3d(channels, hidden, kernel_size=1, bias=self.bias),
             nn.ReLU(inplace=True),
             nn.Conv3d(hidden, channels, kernel_size=1, bias=self.bias),
         )
+        self.net.to(ref.device, dtype=ref.dtype)
 
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B,C,*,*,*) any spatial
         if self.net is None:
-            self._build(x.shape[1])
+            self._build(x.shape[1],x)
         return self.net(x)

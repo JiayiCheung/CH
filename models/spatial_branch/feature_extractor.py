@@ -1,104 +1,60 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional
 
-
+# ---------------- Depth-wise separable 3-D conv ----------------
 class DepthwiseSeparableConv3d(nn.Module):
-	"""深度可分离3D卷积"""
-	
-	def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
-		"""
-		初始化深度可分离3D卷积
+    def __init__(self, in_ch: int, out_ch: int, k: int = 3, stride: int = 1, pad: Optional[int] = None ):
+        super().__init__()
+        pad = k // 2 if pad is None else pad
+        self.dw = nn.Conv3d(in_ch, in_ch, k, stride, pad, groups=in_ch, bias=False)
+        self.pw = nn.Conv3d(in_ch, out_ch, 1, bias=False)
 
-		参数:
-			in_channels: 输入通道数
-			out_channels: 输出通道数
-			kernel_size: 卷积核大小
-			stride: 步长
-			padding: 填充
-		"""
-		super().__init__()
-		
-		# 深度卷积
-		self.depthwise = nn.Conv3d(
-			in_channels, in_channels, kernel_size=kernel_size,
-			stride=stride, padding=padding, groups=in_channels
-		)
-		
-		# 逐点卷积
-		self.pointwise = nn.Conv3d(
-			in_channels, out_channels, kernel_size=1
-		)
-	
-	def forward(self, x):
-		"""前向传播"""
-		x = self.depthwise(x)
-		x = self.pointwise(x)
-		return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.pw(self.dw(x))
 
 
+# ---------------- Lightweight Spatial Feature Extractor --------
 class SpatialFeatureExtractor(nn.Module):
-	"""轻量级空间特征提取器"""
-	
-	def __init__(self, in_channels=1, mid_channels=16, out_channels=16):
-		"""
-		初始化空间特征提取器
+    """
+    in  → Conv3d → GN → ReLU
+        → DWConv → GN → ReLU
+        → DWConv → GN → ReLU → out
+    + residual (identity or 1×1 Conv)
+    """
 
-		参数:
-			in_channels: 输入通道数
-			mid_channels: 中间通道数
-			out_channels: 输出通道数
-		"""
-		super().__init__()
-		
-		# 特征提取网络
-		self.encoder = nn.Sequential(
-			# 第一层: 标准3D卷积
-			nn.Conv3d(in_channels, mid_channels, kernel_size=3, padding=1),
-			nn.InstanceNorm3d(mid_channels),
-			nn.ReLU(inplace=True),
-			
-			# 第二层: 深度可分离卷积
-			DepthwiseSeparableConv3d(mid_channels, mid_channels * 2, kernel_size=3),
-			nn.InstanceNorm3d(mid_channels * 2),
-			nn.ReLU(inplace=True),
-			
-			# 第三层: 深度可分离卷积
-			DepthwiseSeparableConv3d(mid_channels * 2, out_channels, kernel_size=3),
-			nn.InstanceNorm3d(out_channels),
-			nn.ReLU(inplace=True)
-		)
-		
-		# 残差连接
-		self.shortcut = None
-		if in_channels != out_channels:
-			self.shortcut = nn.Conv3d(in_channels, out_channels, kernel_size=1)
-	
-	def forward(self, x):
-		"""
-		前向传播
+    def __init__(self, in_channels: int = 1, mid_channels: int = 16, out_channels: int = 16):
+        super().__init__()
 
-		参数:
-			x: 输入体积 [B, C, D, H, W]
+        # Helper to choose reasonable GN groups
+        def _gn(c: int) -> nn.GroupNorm:
+            return nn.GroupNorm(num_groups=max(4, c // 4), num_channels=c, affine=True)
 
-		返回:
-			提取的特征 [B, out_channels, D, H, W]
-		"""
-		# 提取特征
-		features = self.encoder(x)
-		
-		# 添加残差连接
-		if self.shortcut:
-			residual = self.shortcut(x)
-		else:
-			residual = x
-		
-		# 防止尺寸不匹配
-		if residual.shape[2:] != features.shape[2:]:
-			residual = nn.functional.interpolate(
-				residual, size=features.shape[2:], mode='trilinear', align_corners=True
-			)
-		
-		# 残差连接
-		output = features + residual
-		
-		return output
+        self.encoder = nn.Sequential(
+            nn.Conv3d(in_channels, mid_channels, 3, padding=1, bias=False),
+            _gn(mid_channels), nn.ReLU(inplace=True),
+
+            DepthwiseSeparableConv3d(mid_channels, mid_channels * 2),
+            _gn(mid_channels * 2), nn.ReLU(inplace=True),
+
+            DepthwiseSeparableConv3d(mid_channels * 2, out_channels),
+            _gn(out_channels), nn.ReLU(inplace=True),
+        )
+
+        # Residual path
+        self.shortcut = (
+            nn.Conv3d(in_channels, out_channels, 1, bias=False)
+            if in_channels != out_channels else nn.Identity()
+        )
+
+    # ------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self.encoder(x)
+        res  = self.shortcut(x)
+
+        # spatial shape guard (rare, only if stride ≠1 added later)
+        if res.shape[2:] != feat.shape[2:]:
+            res = F.interpolate(res, size=feat.shape[2:], mode="trilinear", align_corners=True)
+
+        return feat + res

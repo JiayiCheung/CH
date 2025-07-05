@@ -1,123 +1,123 @@
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .ch_branch import CHBranch
 from .spatial_branch import SpatialBranch
-from .fusion import AttentionFusion, MultiscaleFusion
+from .fusion.attention_fusion import AttentionFusion
+from .fusion.multiscale_fusion import MultiscaleFusion
+from .spatial_branch.edge_enhancement import EdgeEnhancement
+
+__all__ = ["VesselSegmenter"]
 
 
 class VesselSegmenter(nn.Module):
-	"""肝脏血管分割模型"""
-	
-	def __init__(self, in_channels=1, out_channels=1, ch_params=None, tier_params=None):
-		"""
-		初始化分割模型
+    """Three‑tier TA‑CHNet with fully adaptive channel dimensions."""
 
-		参数:
-			in_channels: 输入通道数
-			out_channels: 输出通道数 (1用于二分类，>1用于多分类)
-			ch_params: CH支路参数 {max_n, max_k, max_l, cylindrical_dims}
-			tier_params: 不同tier的特定参数 {0: {}, 1: {}, 2: {}}
-		"""
-		super().__init__()
-		
-		# 默认CH参数
-		if ch_params is None:
-			ch_params = {
-				'max_n': 3,
-				'max_k': 4,
-				'max_l': 5,
-				'cylindrical_dims': (32, 36, 32)
-			}
-		
-		# 默认tier参数
-		if tier_params is None:
-			tier_params = {
-				0: {'max_n': 2, 'max_k': 3, 'max_l': 4},  # 器官级别
-				1: {'max_n': 3, 'max_k': 4, 'max_l': 5},  # 结构级别
-				2: {'max_n': 4, 'max_k': 5, 'max_l': 6}  # 细节级别
-			}
-		
-		self.tier_params = tier_params
-		self.current_tier = None
-		
-		# 特征通道数
-		ch_channels = 16
-		spatial_channels = 16
-		
-		# 初始化分支
-		self.ch_branch = CHBranch(**ch_params)
-		self.spatial_branch = SpatialBranch(in_channels, 16, spatial_channels)
-		
-		# 特征融合
-		self.attention_fusion = AttentionFusion(ch_channels, spatial_channels)
-		
-		# 多尺度融合
-		self.multiscale_fusion = MultiscaleFusion(ch_channels + spatial_channels)
-		
-		# 分割头
-		self.segmentation_head = nn.Sequential(
-			nn.Conv3d(ch_channels + spatial_channels, 32, kernel_size=3, padding=1),
-			nn.InstanceNorm3d(32),
-			nn.ReLU(inplace=True),
-			nn.Conv3d(32, out_channels, kernel_size=1),
-			nn.Sigmoid() if out_channels == 1 else nn.Softmax(dim=1)
-		)
-		
-		# 缓存不同tier的特征
-		self.tier_features = {}
-	
-	def set_tier(self, tier):
-		"""设置当前tier"""
-		self.current_tier = tier
-		self.ch_branch.set_tier(tier)
-		
-		# 清除缓存的特征
-		self.tier_features = {}
-	
-	def forward(self, x, tier=None):
-		"""
-		前向传播
+    def __init__(
+        self,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        ch_params: Dict | None = None,
+        tier_params: Dict | None = None,
+    ) -> None:
+        super().__init__()
 
-		参数:
-			x: 输入体积 [B, C, D, H, W]
-			tier: 当前tier，如果不是None则更新current_tier
+        # ------------------------------------------------------------------
+        # Branches
+        # ------------------------------------------------------------------
+        if ch_params is None:
+            ch_params = {
+                "max_n": 3,
+                "max_k": 4,
+                "max_l": 5,
+                "cylindrical_dims": (32, 36, 32),
+            }
+        if tier_params is None:
+            tier_params = {
+                0: {"max_n": 2, "max_k": 3, "max_l": 4},
+                1: {"max_n": 3, "max_k": 4, "max_l": 5},
+                2: {"max_n": 4, "max_k": 5, "max_l": 6},
+            }
+        self.tier_params = tier_params
+        self.current_tier: int | None = None
+        self.edge_enhance = EdgeEnhancement(out_channels=8)
 
-		返回:
-			分割结果 [B, out_channels, D, H, W]
-		"""
-		# 更新tier
-		if tier is not None:
-			self.set_tier(tier)
-		
-		# 确保已设置tier
-		if self.current_tier is None:
-			raise ValueError("Tier must be set before forward pass")
-		
-		# 获取tier特定参数
-		tier_ch_params = self.tier_params.get(self.current_tier, {})
-		r_scale = tier_ch_params.get('r_scale', 1.0)
-		
-		# CH支路
-		ch_features = self.ch_branch(x, r_scale=r_scale)
-		
-		# 空间支路
-		spatial_features = self.spatial_branch(x)
-		
-		# 特征融合
-		fused_features = self.attention_fusion(ch_features, spatial_features)
-		
-		# 缓存当前tier的特征
-		self.tier_features[self.current_tier] = fused_features
-		
-		# 如果所有tier都已处理，执行多尺度融合
-		if len(self.tier_features) > 1:
-			final_features = self.multiscale_fusion(self.tier_features)
-		else:
-			final_features = fused_features
-		
-		# 分割头
-		output = self.segmentation_head(final_features)
-		
-		return output
+        self.ch_branch = CHBranch(**ch_params)
+        self.spatial_branch = SpatialBranch(in_channels, 16, 16)  # 内部自己决定输出通道
+
+        # ------------------------------------------------------------------
+        # Fusion & head – lazy adaptive
+        # ------------------------------------------------------------------
+        self.attention_fusion = AttentionFusion()       # lazy inside
+        self.multiscale_fusion = MultiscaleFusion()     # lazy inside
+
+        self.seg_head_first: nn.Conv3d | None = None    # lazy build on first forward
+        self.seg_head_tail = nn.Sequential(
+            nn.InstanceNorm3d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(32, out_channels, 1),
+            nn.Sigmoid() if out_channels == 1 else nn.Softmax(dim=1),
+        )
+
+        # cache for tier features
+        self.tier_features: Dict[int, torch.Tensor] = {}
+
+    # ------------------------------------------------------------------
+    # Utility builders
+    # ------------------------------------------------------------------
+    def _build_seg_head(self, in_c: int, ref: torch.Tensor):
+        """Create first 3×3 conv to map `in_c → 32`, align device/dtype."""
+        self.seg_head_first = nn.Conv3d(in_c, 32, 3, padding=1, bias=False)
+        self.seg_head_first.to(ref.device, dtype=ref.dtype)
+
+    # ------------------------------------------------------------------
+    # Tier control helpers
+    # ------------------------------------------------------------------
+    def set_tier(self, tier: int):
+        self.current_tier = tier
+        self.ch_branch.set_tier(tier)
+        self.tier_features.clear()
+
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor, tier: int | None = None) -> torch.Tensor:
+        if tier is not None:
+            self.set_tier(tier)
+        if self.current_tier is None:
+            raise ValueError("Tier must be set before forward pass")
+
+        # Tier‑specific scaling factor
+        r_scale = self.tier_params.get(self.current_tier, {}).get("r_scale", 1.0)
+        edge_feat = self.edge_enhance(x)
+        
+        # Branch forward
+        ch_features = self.ch_branch(x, r_scale=r_scale)
+        spatial_features = self.spatial_branch(x)
+
+        # Fuse
+        fused = self.attention_fusion(ch_features, spatial_features)
+        self.tier_features[self.current_tier] = fused
+
+        # Multi‑tier fusion if >1 tier collected
+        final = (
+            self.multiscale_fusion(self.tier_features)
+            if len(self.tier_features) > 1
+            else fused
+        )
+
+        # Lazy build segmentation head
+        if self.seg_head_first is None:
+            self._build_seg_head(final.shape[1], final)
+        # ensure seg_head_first on right device/dtype even after .to()
+        if next(self.seg_head_first.parameters()).device != final.device or \
+           next(self.seg_head_first.parameters()).dtype  != final.dtype:
+            self.seg_head_first.to(final.device, dtype=final.dtype)
+
+        logits = self.seg_head_tail(self.seg_head_first(final))
+        return logits

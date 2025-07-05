@@ -34,4 +34,5 @@ python train.py \
   --batch_size 1 \
   --epochs 10 \
   --lr 1e-4 \
+  --num_workers 0 \
   --val_interval 1 --local_rank 0
