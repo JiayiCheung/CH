@@ -1,165 +1,107 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Tuple
 
+# -----------------------------------------------------------------------------
+# 复数工具：直接调用项目统一封装
+# -----------------------------------------------------------------------------
+from models.complex.tensor_utils import magnitude as mag  # 实->自身, 复->幅值
+from models.complex.tensor_utils import apply_real_weight # w 实数, 自动广播到复数实/虚
+
+# -----------------------------------------------------------------------------
+# Channel‑wise Attention (CBAM‑style, 3‑D, complex‑aware)
+# -----------------------------------------------------------------------------
 
 class ChannelAttention(nn.Module):
-	"""通道注意力模块"""
-	
-	def __init__(self, channels, reduction_ratio=16):
-		"""
-		初始化通道注意力
+    """Channel attention that works for real *or* complex tensors.
 
-		参数:
-			channels: 输入通道数
-			reduction_ratio: 降维比例
-		"""
-		super().__init__()
-		
-		# 确保降维后至少有8个通道
-		reduced_channels = max(8, channels // reduction_ratio)
-		
-		# 全局平均池化后的特征变换
-		self.avg_pool = nn.AdaptiveAvgPool3d(1)
-		self.max_pool = nn.AdaptiveMaxPool3d(1)
-		
-		# 共享MLP
-		self.mlp = nn.Sequential(
-			nn.Conv3d(channels, reduced_channels, kernel_size=1, bias=False),
-			nn.ReLU(inplace=True),
-			nn.Conv3d(reduced_channels, channels, kernel_size=1, bias=False)
-		)
-		
-		self.sigmoid = nn.Sigmoid()
-	
-	def forward(self, x):
-		"""
-		前向传播
+    若输入为复数，注意力计算仅基于幅值；生成的权重仍为实数并同时施加于
+    实部/虚部。输出维度 `(B,C,1,1,1)`.
+    """
 
-		参数:
-			x: 输入特征 [B, C, D, H, W]
+    def __init__(self, channels: int, reduction_ratio: int = 16):
+        super().__init__()
+        hidden = max(8, channels // reduction_ratio)
 
-		返回:
-			注意力权重 [B, C, 1, 1, 1]
-		"""
-		# 平均池化分支
-		avg_out = self.mlp(self.avg_pool(x))
-		
-		# 最大池化分支
-		max_out = self.mlp(self.max_pool(x))
-		
-		# 合并两个分支
-		out = avg_out + max_out
-		
-		return self.sigmoid(out)
+        self.avg_pool = nn.AdaptiveAvgPool3d(1)
+        self.max_pool = nn.AdaptiveMaxPool3d(1)
 
+        self.mlp = nn.Sequential(
+            nn.Conv3d(channels, hidden, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(hidden, channels, 1, bias=False),
+        )
+        self.act = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_mag = mag(x)                                      # (B,C,1,1,1)
+        attn = self.mlp(self.avg_pool(x_mag)) + self.mlp(self.max_pool(x_mag))
+        return self.act(attn)
+
+# -----------------------------------------------------------------------------
+# Spatial Attention (3‑D, complex‑aware)
+# -----------------------------------------------------------------------------
 
 class SpatialAttention(nn.Module):
-	"""空间注意力模块"""
-	
-	def __init__(self, kernel_size=7):
-		"""
-		初始化空间注意力
+    """Spatial attention for 3‑D features, complex compatible."""
 
-		参数:
-			kernel_size: 卷积核大小
-		"""
-		super().__init__()
-		
-		# 确保kernel_size是奇数
-		assert kernel_size % 2 == 1, "Kernel size must be odd"
-		
-		padding = kernel_size // 2
-		
-		# 通道聚合+卷积
-		self.conv = nn.Conv3d(2, 1, kernel_size=kernel_size, padding=padding)
-		self.sigmoid = nn.Sigmoid()
-	
-	def forward(self, x):
-		"""
-		前向传播
+    def __init__(self, kernel_size: int = 7):
+        super().__init__()
+        assert kernel_size % 2 == 1, "kernel_size must be odd"
+        padding = kernel_size // 2
+        self.conv = nn.Conv3d(2, 1, kernel_size, padding=padding, bias=False)
+        self.act = nn.Sigmoid()
 
-		参数:
-			x: 输入特征 [B, C, D, H, W]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_mag = mag(x)
+        avg = x_mag.mean(dim=1, keepdim=True)
+        mx, _ = x_mag.max(dim=1, keepdim=True)
+        return self.act(self.conv(torch.cat([avg, mx], dim=1)))  # (B,1,D,H,W)
 
-		返回:
-			注意力权重 [B, 1, D, H, W]
-		"""
-		# 通道维度上的平均池化和最大池化
-		avg_out = torch.mean(x, dim=1, keepdim=True)
-		max_out, _ = torch.max(x, dim=1, keepdim=True)
-		
-		# 合并池化结果
-		out = torch.cat([avg_out, max_out], dim=1)
-		
-		# 应用卷积和激活
-		out = self.conv(out)
-		
-		return self.sigmoid(out)
-
+# -----------------------------------------------------------------------------
+# Dual‑attention Fusion
+# -----------------------------------------------------------------------------
 
 class AttentionFusion(nn.Module):
-	"""双重注意力特征融合模块"""
-	
-	def __init__(self, ch_channels, spatial_channels):
-		"""
-		初始化特征融合模块
+    """Fuse CH‑branch & spatial‑branch features with CBAM‑like dual attention.
 
-		参数:
-			ch_channels: CH支路特征通道数
-			spatial_channels: 空间支路特征通道数
-		"""
-		super().__init__()
-		
-		# 合并后的通道数
-		self.combined_channels = ch_channels + spatial_channels
-		
-		# 通道注意力
-		self.channel_attention = ChannelAttention(self.combined_channels)
-		
-		# 空间注意力
-		self.spatial_attention = SpatialAttention(kernel_size=7)
-		
-		# 特征融合卷积
-		self.fusion_conv = nn.Sequential(
-			nn.Conv3d(self.combined_channels, self.combined_channels, kernel_size=3, padding=1),
-			nn.InstanceNorm3d(self.combined_channels),
-			nn.ReLU(inplace=True)
-		)
-	
-	def forward(self, ch_features, spatial_features):
-		"""
-		前向传播
+    输入：
+        ch_feat  – (B, C_ch, D, H, W)
+        sp_feat  – (B, C_sp, D, H, W)
+    输出：
+        fused    – (B, C_ch+C_sp, D, H, W)
+    支持实数与复数特征；当输入异形尺寸时自动三线性插值对齐。
+    """
 
-		参数:
-			ch_features: CH支路特征 [B, ch_channels, D, H, W]
-			spatial_features: 空间支路特征 [B, spatial_channels, D, H, W]
+    def __init__(self, ch_channels: int, spatial_channels: int):
+        super().__init__()
+        self.total_c = ch_channels + spatial_channels
+        self.chan_att = ChannelAttention(self.total_c)
+        self.spa_att = SpatialAttention()
+        self.fuse_conv = nn.Sequential(
+            nn.Conv3d(self.total_c, self.total_c, 3, padding=1, bias=False),
+            nn.InstanceNorm3d(self.total_c),
+            nn.ReLU(inplace=True),
+        )
 
-		返回:
-			融合特征 [B, ch_channels+spatial_channels, D, H, W]
-		"""
-		# 确保空间维度匹配
-		if ch_features.shape[2:] != spatial_features.shape[2:]:
-			spatial_features = F.interpolate(
-				spatial_features, size=ch_features.shape[2:],
-				mode='trilinear', align_corners=True
-			)
-		
-		# 合并特征
-		combined = torch.cat([ch_features, spatial_features], dim=1)
-		
-		# 应用通道注意力
-		channel_weights = self.channel_attention(combined)
-		channel_refined = combined * channel_weights
-		
-		# 应用空间注意力
-		spatial_weights = self.spatial_attention(channel_refined)
-		spatial_refined = channel_refined * spatial_weights
-		
-		# 残差连接
-		refined = spatial_refined + combined
-		
-		# 应用融合卷积
-		output = self.fusion_conv(refined)
-		
-		return output
+    # ------------------------------------------------------------------
+    def forward(self, ch_feat: torch.Tensor, sp_feat: torch.Tensor) -> torch.Tensor:
+        # --- spatial align --------------------------------------------------
+        if ch_feat.shape[2:] != sp_feat.shape[2:]:
+            sp_feat = F.interpolate(sp_feat, size=ch_feat.shape[2:], mode="trilinear", align_corners=True)
+
+        x = torch.cat([ch_feat, sp_feat], dim=1)                # (B,total,*)
+
+        # --- Channel attention --------------------------------------------
+        w_c = self.chan_att(x)                                  # (B,C,1,1,1)
+        x = apply_real_weight(x, w_c)
+
+        # --- Spatial attention --------------------------------------------
+        w_s = self.spa_att(x)                                   # (B,1,D,H,W)
+        x = apply_real_weight(x, w_s)
+
+        # --- Residual + conv fusion ---------------------------------------
+        x = x + torch.cat([ch_feat, sp_feat], dim=1)
+        x = self.fuse_conv(x)
+        return x

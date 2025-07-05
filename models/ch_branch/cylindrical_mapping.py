@@ -1,162 +1,100 @@
+import math
+from functools import lru_cache
+from typing import Tuple
+
 import torch
 import torch.nn.functional as F
-import math
-from utils.complex_ops import complex_grid_sample_3d
+
+from models.complex.utils import apply_to_complex
+
+# complex‑aware grid_sample (real/imag split automatically handled)
+complex_grid_sample = apply_to_complex(F.grid_sample)
 
 
 class CylindricalMapping:
-	"""笛卡尔坐标到柱坐标的可微分映射"""
-	
-	def __init__(self, r_samples=32, theta_samples=36, z_samples=32):
-		"""
-		初始化柱坐标映射器
+    """Differentiable Cartesian ↔ Cylindrical mapping for 3‑D volumes.
 
-		参数:
-			r_samples: 径向采样点数
-			theta_samples: 角度采样点数
-			z_samples: 轴向采样点数
-		"""
-		self.r_samples = r_samples
-		self.theta_samples = theta_samples
-		self.z_samples = z_samples
-		
-		# 缓存网格
-		self.grid_cache = {}
-	
-	def _create_sampling_grid(self, batch_size, depth, height, width, device):
-		"""
-		创建用于网格采样的柱坐标网格
+    Notes
+    -----
+    * Supports **real or complex** tensors of shape (B,C,D,H,W).
+    * All coordinates are normalised to **[-1,1]** for `grid_sample`.
+    * Grid is cached per spatial shape on **first call** (use LRU).
+    """
 
-		参数:
-			batch_size: 批次大小
-			depth, height, width: 输入体积的形状
-			device: 计算设备
+    def __init__(self,
+                 r_samples: int = 32,
+                 theta_samples: int = 36,
+                 z_samples: int = 32):
+        self.r_samples = r_samples
+        self.theta_samples = theta_samples
+        self.z_samples = z_samples
 
-		返回:
-			用于grid_sample的采样网格
-		"""
-		# 检查缓存
-		cache_key = (batch_size, depth, height, width, device)
-		if cache_key in self.grid_cache:
-			return self.grid_cache[cache_key]
-		
-		# 创建柱坐标网格
-		r = torch.linspace(0, 1, self.r_samples, device=device)
-		theta = torch.linspace(0, 2 * math.pi, self.theta_samples, device=device)
-		z = torch.linspace(-1, 1, self.z_samples, device=device)
-		
-		# 网格化
-		r_grid, theta_grid, z_grid = torch.meshgrid(r, theta, z, indexing='ij')
-		
-		# 转换为笛卡尔坐标 (归一化到[-1, 1])
-		x_grid = r_grid * torch.cos(theta_grid)
-		y_grid = r_grid * torch.sin(theta_grid)
-		
-		# 创建网格采样点 [r_samples, theta_samples, z_samples, 3]
-		grid = torch.stack([z_grid, y_grid, x_grid], dim=-1)
-		
-		# 重塑为grid_sample所需的形状 [batch_size, r_samples, theta_samples, z_samples, 3]
-		grid = grid.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)
-		
-		# 缓存网格
-		self.grid_cache[cache_key] = grid
-		
-		return grid
-	
-	def cartesian_to_cylindrical(self, volume):
-		"""
-		将笛卡尔坐标体积转换为柱坐标表示
+    # ------------------------------------------------------------------
+    # grid builders (cached)
+    # ------------------------------------------------------------------
 
-		参数:
-			volume: 输入体积 [B, C, D, H, W]
+    @lru_cache(maxsize=8)
+    def _cartesian_grid(self, D: int, H: int, W: int, device: torch.device) -> torch.Tensor:
+        """Return (1,D,H,W,3) grid that samples cylindrical → Cartesian."""
+        z = torch.linspace(-1, 1, D, device=device)
+        y = torch.linspace(-1, 1, H, device=device)
+        x = torch.linspace(-1, 1, W, device=device)
+        zz, yy, xx = torch.meshgrid(z, y, x, indexing='ij')
 
-		返回:
-			柱坐标表示 [B, C, r_samples, theta_samples, z_samples]
-		"""
-		B, C, D, H, W = volume.shape
-		
-		# 创建采样网格
-		grid = self._create_sampling_grid(B, D, H, W, volume.device)
-		
-		# 重塑为grid_sample所需的格式
-		volume_reshaped = volume.permute(0, 1, 4, 3, 2)  # [B, C, W, H, D]
-		
-		if torch.is_complex(volume):
-			sampled = complex_grid_sample_3d(volume_reshaped, grid)
-		else:
-			sampled = F.grid_sample(volume_reshaped, grid, ...)
-		
-		
-		# 处理 r=0 处的奇异性
-		r_zero_mask = (grid[..., 1] ** 2 + grid[..., 2] ** 2 < 1e-6)
-		for b in range(B):
-			for c in range(C):
-				for z in range(self.z_samples):
-					# 如果r=0处有点，使用同一z平面上所有角度的平均值
-					if r_zero_mask[b, 0, :, z].any():
-						avg_value = cylindrical_volume[b, c, 0, :, z].mean()
-						cylindrical_volume[b, c, 0, :, z] = avg_value
-		
-		return cylindrical_volume
-	
-	def cylindrical_to_cartesian(self, cylindrical_volume, output_shape):
-		"""
-		将柱坐标表示转换回笛卡尔坐标体积
+        r = torch.sqrt(xx ** 2 + yy ** 2)
+        theta = torch.atan2(yy, xx) % (2 * math.pi)
 
-		参数:
-			cylindrical_volume: 柱坐标表示 [B, C, r_samples, theta_samples, z_samples]
-			output_shape: 输出形状 (D, H, W)
+        r_norm = r                    # [0,1]
+        theta_norm = theta / (2 * math.pi)
+        z_norm = (zz + 1) / 2         # [-1,1] → [0,1]
 
-		返回:
-			笛卡尔坐标体积 [B, C, D, H, W]
-		"""
-		B, C = cylindrical_volume.shape[:2]
-		D, H, W = output_shape
-		
-		# 创建反向映射网格
-		# 这部分更复杂，需要反向计算柱坐标
-		# 为简化实现，我们使用一个近似方法
-		
-		# 创建笛卡尔坐标网格
-		z = torch.linspace(-1, 1, D, device=cylindrical_volume.device)
-		y = torch.linspace(-1, 1, H, device=cylindrical_volume.device)
-		x = torch.linspace(-1, 1, W, device=cylindrical_volume.device)
-		
-		z_grid, y_grid, x_grid = torch.meshgrid(z, y, x, indexing='ij')
-		
-		# 转换为柱坐标
-		r_grid = torch.sqrt(x_grid ** 2 + y_grid ** 2)
-		theta_grid = torch.atan2(y_grid, x_grid) % (2 * math.pi)
-		
-		# 归一化到采样索引范围
-		r_norm = r_grid  # 已经在 [0, 1] 范围内
-		theta_norm = theta_grid / (2 * math.pi)  # [0, 1]
-		z_norm = (z_grid + 1) / 2  # [-1, 1] -> [0, 1]
-		
-		# 创建采样网格
-		grid = torch.stack([
-			2 * z_norm - 1,  # [0, 1] -> [-1, 1]
-			2 * theta_norm - 1,  # [0, 1] -> [-1, 1]
-			2 * r_norm - 1  # [0, 1] -> [-1, 1]
-		], dim=-1)
-		
-		# 调整形状并重复以匹配批次大小
-		grid = grid.unsqueeze(0).repeat(B, 1, 1, 1, 1)
-		
-		# 重塑柱坐标体积以适应grid_sample
-		cylindrical_reshaped = cylindrical_volume.permute(0, 1, 4, 3, 2)  # [B, C, z, theta, r]
-		
-		# 对每个通道执行网格采样
-		cartesian_volumes = []
-		for c in range(C):
-			# 网格采样
-			sampled = F.grid_sample(
-				cylindrical_reshaped[:, c:c + 1], grid,
-				mode='bilinear', align_corners=True
-			)
-			cartesian_volumes.append(sampled)
-		
-		# 合并通道
-		cartesian_volume = torch.cat(cartesian_volumes, dim=1)
-		
-		return cartesian_volume
+        grid = torch.stack([
+            2 * z_norm - 1,
+            2 * theta_norm - 1,
+            2 * r_norm - 1,
+        ], dim=-1)                   # (D,H,W,3)
+        return grid.unsqueeze(0)      # (1,D,H,W,3)
+
+    @lru_cache(maxsize=8)
+    def _cylindrical_grid(self, D: int, H: int, W: int, device: torch.device) -> torch.Tensor:
+        """Return (1,r,θ,z,3) grid that samples Cartesian → cylindrical."""
+        r = torch.linspace(0, 1, self.r_samples, device=device)
+        theta = torch.linspace(0, 2 * math.pi, self.theta_samples, device=device)
+        z = torch.linspace(-1, 1, self.z_samples, device=device)
+        rr, tt, zz = torch.meshgrid(r, theta, z, indexing='ij')
+        xx = rr * torch.cos(tt)
+        yy = rr * torch.sin(tt)
+        grid = torch.stack([zz, yy, xx], dim=-1)  # (r,θ,z,3)
+        return grid.unsqueeze(0)                  # (1,r,θ,z,3)
+
+    # ------------------------------------------------------------------
+    # forward mappings
+    # ------------------------------------------------------------------
+
+    def cartesian_to_cylindrical(self, volume: torch.Tensor) -> torch.Tensor:
+        """Map (B,C,D,H,W) → (B,C,r,θ,z)."""
+        B, C, D, H, W = volume.shape
+        grid = self._cylindrical_grid(D, H, W, volume.device)
+        grid = grid.expand(B, -1, -1, -1, -1)      # (B,r,θ,z,3)
+
+        # grid_sample expects format (B,C,D,H,W) with grid (B,D,H,W,3)
+        # Our grid is (B,r,θ,z,3) → permute to match (D_out,H_out,W_out)
+        vol_perm = volume                             # (B,C,D,H,W)
+        cyl = complex_grid_sample(vol_perm, grid, mode='bilinear', align_corners=True)
+        # output is (B,C,r,θ,z)
+
+        # handle r=0 singularity by averaging over θ
+        cyl[:, :, 0] = cyl[:, :, 0].mean(dim=2, keepdim=True)
+        return cyl
+
+    def cylindrical_to_cartesian(self, cyl: torch.Tensor, out_shape: Tuple[int, int, int]) -> torch.Tensor:
+        """Map (B,C,r,θ,z) → (B,C,D,H,W) with given spatial size."""
+        B, C = cyl.shape[:2]
+        D, H, W = out_shape
+        grid = self._cartesian_grid(D, H, W, cyl.device)
+        grid = grid.expand(B, -1, -1, -1, -1)       # (B,D,H,W,3)
+
+        # reshape cyl => (B,C,z,θ,r) to align with grid_sample's D,H,W order
+        cyl_perm = cyl.permute(0, 1, 4, 3, 2)       # (B,C,z,θ,r)
+        cart = complex_grid_sample(cyl_perm, grid, mode='bilinear', align_corners=True)
+        return cart
