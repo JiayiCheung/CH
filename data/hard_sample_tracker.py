@@ -12,14 +12,14 @@ class HardSampleTracker:
 	
 	def __init__(self, base_dir="difficulty_maps", alpha=0.7, device='cpu', logger=None):
 		"""
-        初始化硬样本跟踪器
+		初始化硬样本跟踪器
 
-        参数:
-            base_dir: 存储难度图的目录
-            alpha: 历史信息权重 (0-1)
-            device: 计算设备
-            logger: 日志记录器实例
-        """
+		参数:
+			base_dir: 存储难度图的目录
+			alpha: 历史信息权重 (0-1)
+			device: 计算设备
+			logger: 日志记录器实例
+		"""
 		self.base_dir = Path(base_dir)
 		self.alpha = alpha
 		self.device = device
@@ -63,12 +63,12 @@ class HardSampleTracker:
 	
 	def initialize_case(self, case_id, shape):
 		"""
-        初始化案例的难度图
+		初始化案例的难度图
 
-        参数:
-            case_id: 案例ID
-            shape: 数据形状 [D, H, W]
-        """
+		参数:
+			case_id: 案例ID
+			shape: 数据形状 [D, H, W]
+		"""
 		# 记录案例维度
 		self.case_dims[case_id] = list(shape)  # 转换为列表以便JSON序列化
 		self._save_metadata()
@@ -89,14 +89,14 @@ class HardSampleTracker:
 	
 	def get_difficulty_map(self, case_id):
 		"""
-        获取案例的难度图
+		获取案例的难度图
 
-        参数:
-            case_id: 案例ID
+		参数:
+			case_id: 案例ID
 
-        返回:
-            难度图数组
-        """
+		返回:
+			难度图数组
+		"""
 		if case_id not in self.case_dims:
 			if self.logger:
 				self.logger.log_warning(f"Case {case_id} not initialized")
@@ -117,16 +117,16 @@ class HardSampleTracker:
 	
 	def update_difficulty(self, case_id, prediction, target):
 		"""
-        基于分割结果更新难度图
+		基于分割结果更新难度图
 
-        参数:
-            case_id: 案例ID
-            prediction: 模型预测 [C, D, H, W]
-            target: 真实标签 [D, H, W]
+		参数:
+			case_id: 案例ID
+			prediction: 模型预测 [C, D, H, W]
+			target: 真实标签 [D, H, W]
 
-        返回:
-            更新后的难度图
-        """
+		返回:
+			更新后的难度图
+		"""
 		# 获取难度图
 		difficulty_map = self.get_difficulty_map(case_id)
 		if difficulty_map is None:
@@ -163,15 +163,15 @@ class HardSampleTracker:
 	
 	def compute_performance_map(self, prediction, target):
 		"""
-        计算局部性能图
+		计算局部性能图
 
-        参数:
-            prediction: 模型预测 [C, D, H, W]
-            target: 真实标签 [D, H, W]
+		参数:
+			prediction: 模型预测 [C, D, H, W]
+			target: 真实标签 [D, H, W]
 
-        返回:
-            性能图 [D, H, W]，值域[0,1]，值越高表示性能越好
-        """
+		返回:
+			性能图 [D, H, W]，值域[0,1]，值越高表示性能越好
+		"""
 		# 确保输入形状正确
 		if prediction.ndim == 4 and prediction.shape[0] == 1:
 			# 单通道情况
@@ -242,9 +242,11 @@ class HardSampleTracker:
 	def sync_difficulty_maps(self):
 		"""同步所有难度图到磁盘（为了兼容性）"""
 		# 在新设计中，每次更新都会同步到磁盘，此方法保留仅为兼容性
-		pass
+		if self.logger:
+			self.logger.log_info("Syncing difficulty maps to disk")
 	
 	def close(self):
 		"""关闭硬样本跟踪器（为了兼容性）"""
 		# 在新设计中不需要显式关闭，此方法保留仅为兼容性
-		pass
+		if self.logger:
+			self.logger.log_info("Closing hard sample tracker")

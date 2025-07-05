@@ -6,14 +6,16 @@ from skimage import morphology
 class CTPreprocessor:
 	"""CT图像预处理类，提供归一化和ROI提取功能"""
 	
-	def __init__(self, clip_percentiles=(0.5, 99.5)):
+	def __init__(self, clip_percentiles=(0.5, 99.5), logger=None):
 		"""
 		初始化预处理器
 
 		参数:
 			clip_percentiles: 用于归一化的百分位数裁剪范围
+			logger: 日志记录器实例
 		"""
 		self.clip_percentiles = clip_percentiles
+		self.logger = logger
 	
 	def normalize(self, volume):
 		"""
@@ -33,6 +35,9 @@ class CTPreprocessor:
 		
 		# 裁剪到[0,1]范围
 		normalized = np.clip(normalized, 0, 1)
+		
+		if self.logger:
+			self.logger.log_info(f"Normalized volume with percentiles: {self.clip_percentiles}")
 		
 		return normalized
 	
@@ -67,6 +72,10 @@ class CTPreprocessor:
 				largest_label = np.argmax(sizes)
 				binary = labels == largest_label
 		
+		if self.logger:
+			self.logger.log_info(f"Extracted liver ROI with threshold: {threshold}")
+			self.logger.log_info(f"ROI volume: {np.sum(binary)} voxels")
+		
 		return binary
 	
 	def apply_windowing(self, volume, window_center, window_width):
@@ -90,5 +99,8 @@ class CTPreprocessor:
 		
 		# 裁剪到[0,1]范围
 		windowed = np.clip(windowed, 0, 1)
+		
+		if self.logger:
+			self.logger.log_info(f"Applied windowing: center={window_center}, width={window_width}")
 		
 		return windowed

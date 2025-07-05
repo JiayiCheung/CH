@@ -3,8 +3,6 @@ from scipy import ndimage
 from scipy.ndimage import zoom
 from skimage import morphology
 import random
-from .importance_sampler import ImportanceSampler
-from .complexity_analyzer import ComplexityAnalyzer
 
 
 class TierSampler:
@@ -30,7 +28,10 @@ class TierSampler:
 		self.max_tier2 = max_tier2
 		self.logger = logger
 		
-		# 初始化智能采样组件
+		# 初始化智能采样组件 - 延迟导入避免循环引用
+		from .importance_sampler import ImportanceSampler
+		from .complexity_analyzer import ComplexityAnalyzer
+		
 		self.importance_sampler = ImportanceSampler(logger=logger)
 		self.complexity_analyzer = ComplexityAnalyzer(logger=logger)
 		
@@ -88,6 +89,10 @@ class TierSampler:
 		max_tier1 = tier1_samples
 		max_tier2 = tier2_samples
 		
+		if self.logger:
+			self.logger.log_info(f"Sampling case {case_id} with complexity {complexity:.2f}")
+			self.logger.log_info(f"Tier1 samples: {max_tier1}, Tier2 samples: {max_tier2}")
+		
 		# 调用增强版三级采样函数
 		return self.enhanced_three_tier_sampling(
 			image_data, label_data, liver_mask,
@@ -128,11 +133,19 @@ class TierSampler:
 			for i, c in enumerate(center)
 		)
 		img0 = image_data[slices]
-		lbl0 = label_data[slices]
+		lbl0 = label_data[slices] if label_data is not None else None
 		# 强制调整为目标大小
 		img0 = zoom(img0, [tier0_size / s for s in img0.shape], order=1)
-		lbl0 = zoom(lbl0, [tier0_size / s for s in lbl0.shape], order=0)
+		if lbl0 is not None:
+			lbl0 = zoom(lbl0, [tier0_size / s for s in lbl0.shape], order=0)
 		patches.append({'tier': 0, 'image': img0, 'label': lbl0})
+		
+		if self.logger:
+			self.logger.log_info(f"Created Tier-0 patch of size {img0.shape}")
+		
+		# 如果没有标签数据，只返回Tier-0采样块
+		if label_data is None:
+			return patches
 		
 		# ---- TIER-1: 结构级别 (智能采样增强) ----
 		foreground_mask = (label_data > 0)
@@ -203,11 +216,15 @@ class TierSampler:
 				points = self.importance_sampler.importance_based_sampling(
 					points, combined_weights, max_tier1
 				)
+				if self.logger:
+					self.logger.log_info(f"通过智能采样选择了{len(points)}个Tier-1点")
 		else:
 			# 原始均匀采样
 			if len(points) > max_tier1:
 				sel_idx = np.linspace(0, len(points) - 1, max_tier1).astype(int)
 				points = points[sel_idx]
+				if self.logger:
+					self.logger.log_info(f"通过均匀采样选择了{len(points)}个Tier-1点")
 		
 		# 提取Tier-1块
 		for pt in points:
@@ -224,6 +241,9 @@ class TierSampler:
 				lbl1 = zoom(lbl1, [tier1_size / s for s in lbl1.shape], order=0)
 			patches.append({'tier': 1, 'image': img1, 'label': lbl1})
 		
+		if self.logger:
+			self.logger.log_info(f"Created {len(points)} Tier-1 patches")
+		
 		# ---- TIER-2: 细节级别 (智能采样增强) ----
 		# 提取细微结构
 		vessel_mask = (label_data > 0.5) & (label_data < 1.5)
@@ -233,6 +253,9 @@ class TierSampler:
 		thin_mask = (dist_map > 0) & (dist_map <= 5)
 		skel_detail = morphology.skeletonize(thin_mask)
 		detail_points = np.array(np.where(skel_detail)).T
+		
+		if self.logger:
+			self.logger.log_info(f"细节骨架上得到点数: {len(detail_points)}")
 		
 		# 应用智能采样 (如果启用)
 		if importance_weight > 0 and len(detail_points) > 0:
@@ -271,11 +294,15 @@ class TierSampler:
 				detail_points = self.importance_sampler.importance_based_sampling(
 					detail_points, combined_weights, max_tier2
 				)
+				if self.logger:
+					self.logger.log_info(f"通过智能采样选择了{len(detail_points)}个Tier-2点")
 		else:
 			# 原始随机采样
 			if len(detail_points) > max_tier2:
 				idx = np.random.choice(len(detail_points), max_tier2, replace=False)
 				detail_points = detail_points[idx]
+				if self.logger:
+					self.logger.log_info(f"通过随机采样选择了{len(detail_points)}个Tier-2点")
 		
 		# 提取Tier-2块
 		for pt in detail_points:
@@ -291,5 +318,9 @@ class TierSampler:
 				img2 = zoom(img2, [tier2_size / s for s in img2.shape], order=1)
 				lbl2 = zoom(lbl2, [tier2_size / s for s in lbl2.shape], order=0)
 			patches.append({'tier': 2, 'image': img2, 'label': lbl2})
+		
+		if self.logger:
+			self.logger.log_info(f"Created {len(detail_points)} Tier-2 patches")
+			self.logger.log_info(f"Total patches: {len(patches)}")
 		
 		return patches

@@ -8,8 +8,6 @@ from pathlib import Path
 
 from .processing import CTPreprocessor
 from .tier_sampling import TierSampler
-from .hard_sample_tracker import HardSampleTracker
-from utils.sampling_scheduler import SamplingScheduler
 
 
 class LiverVesselDataset(Dataset):
@@ -46,17 +44,21 @@ class LiverVesselDataset(Dataset):
 		self.logger = logger
 		
 		# 初始化预处理器和采样器
-		self.preprocessor = CTPreprocessor() if preprocess else None
+		self.preprocessor = CTPreprocessor(logger=logger) if preprocess else None
 		self.sampler = TierSampler(logger=logger)
 		
 		# 设置采样调度器
 		self.sampling_scheduler = sampling_scheduler
 		if sampling_scheduler is None and enable_smart_sampling:
+			# 延迟导入避免循环引用
+			from utils.sampling_scheduler import SamplingScheduler
 			self.sampling_scheduler = SamplingScheduler(logger=logger)
 		
 		# 设置硬样本跟踪器
 		self.hard_sample_tracker = hard_sample_tracker
 		if hard_sample_tracker is None and enable_smart_sampling:
+			# 延迟导入避免循环引用
+			from .hard_sample_tracker import HardSampleTracker
 			self.hard_sample_tracker = HardSampleTracker(difficulty_maps_dir, logger=logger)
 		
 		# 加载数据
