@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import math
+from utils.complex_ops import complex_grid_sample_3d
 
 
 class CylindricalMapping:
@@ -80,18 +81,11 @@ class CylindricalMapping:
 		# 重塑为grid_sample所需的格式
 		volume_reshaped = volume.permute(0, 1, 4, 3, 2)  # [B, C, W, H, D]
 		
-		# 对每个通道执行网格采样
-		cylindrical_volumes = []
-		for c in range(C):
-			# 网格采样
-			sampled = F.grid_sample(
-				volume_reshaped[:, c:c + 1], grid,
-				mode='bilinear', align_corners=True
-			)
-			cylindrical_volumes.append(sampled)
+		if torch.is_complex(volume):
+			sampled = complex_grid_sample_3d(volume_reshaped, grid)
+		else:
+			sampled = F.grid_sample(volume_reshaped, grid, ...)
 		
-		# 合并通道
-		cylindrical_volume = torch.cat(cylindrical_volumes, dim=1)
 		
 		# 处理 r=0 处的奇异性
 		r_zero_mask = (grid[..., 1] ** 2 + grid[..., 2] ** 2 < 1e-6)
