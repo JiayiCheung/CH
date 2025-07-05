@@ -6,8 +6,8 @@ from typing import Tuple
 # -----------------------------------------------------------------------------
 # 复数工具：直接调用项目统一封装
 # -----------------------------------------------------------------------------
-from models.complex.tensor_utils import magnitude as mag  # 实->自身, 复->幅值
-from models.complex.tensor_utils import apply_real_weight # w 实数, 自动广播到复数实/虚
+from models.complex.utils import magnitude as mag
+from models.complex.utils import apply_real_weight
 
 # -----------------------------------------------------------------------------
 # Channel‑wise Attention (CBAM‑style, 3‑D, complex‑aware)
