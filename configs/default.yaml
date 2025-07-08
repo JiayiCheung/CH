@@ -1,12 +1,12 @@
 # =============================================================================
-# 默认配置文件  （所有实验先读取此文件，再用 tier0_pretrain.yaml 等覆盖差异）
+# 默认配置文件（所有实验先读取此文件，再用tier0_pretrain.yaml等覆盖差异）
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# 数据
-max_cases:        2
-max_val_cases:     1
-random_sampling:  true
+# 数据参数
+max_cases: 2
+max_val_cases: 1
+random_sampling: true
 
 # -----------------------------------------------------------------------------
 # CH-Branch 参数
@@ -19,61 +19,79 @@ ch_params:
 # -----------------------------------------------------------------------------
 # Tier-specific 参数
 tier_params:
-  0:
+  0:  # 器官级别
     max_n: 2
     max_k: 3
     max_l: 4
     r_scale: 1.0
-  1:
+  1:  # 结构级别
     max_n: 3
     max_k: 4
     max_l: 5
     r_scale: 1.5
-  2:
+  2:  # 细节级别
     max_n: 4
     max_k: 5
     max_l: 6
     r_scale: 2.0
 
 # -----------------------------------------------------------------------------
-# Optimizer / 训练
-optimizer:                       # ← 新增
-  base_lr:          1.0e-4       # 主干 LR
-  kernel_lr_scale:  0.1          # EdgeEnhancement.kernels = base_lr × 0.1
-  weight_decay:     1.0e-5
-
-amp: true                        # ← 新增：是否默认开启混合精度
+# 优化器和训练参数
+optimizer:
+  base_lr: 1.0e-4       # 主干学习率
+  kernel_lr_scale: 0.1  # EdgeEnhancement.kernels参数组学习率缩放比例
+  weight_decay: 1.0e-5  # 权重衰减
 
 # -----------------------------------------------------------------------------
-# 损失相关
-vessel_weight: 10.0
-tumor_weight:  15.0              # 如新版 loss 未用，可保留不影响
-use_boundary:  true
+# 混合精度和内存布局
+amp: true               # 是否启用自动混合精度
+channels_last: true     # 是否使用channels_last内存格式（提高GPU性能）
 
 # -----------------------------------------------------------------------------
-# Spatial Branch
-spatial_out_channels: 16         # 若改动 SpatialFeatureExtractor 输出通道在此同步
+# 损失函数参数
+vessel_weight: 10.0     # 血管类别权重
+tumor_weight: 15.0      # 肿瘤类别权重
+use_boundary: true      # 是否使用边界增强损失
 
 # -----------------------------------------------------------------------------
-# Edge-Enhancement 模块                         # ← 新增（如暂不用将 use 设 false）
+# Spatial Branch参数
+spatial_out_channels: 16  # SpatialFeatureExtractor输出通道数
+
+# -----------------------------------------------------------------------------
+# Edge-Enhancement模块参数
 edge:
-  use: true
-  out_channels: 8
+  use: true             # 是否使用边缘增强
+  out_channels: 8       # 边缘增强输出通道数
 
 # -----------------------------------------------------------------------------
-# 推理
-window_size: 64
-overlap:     0.5
+# 推理参数
+window_size: 64         # 滑动窗口大小
+overlap: 0.5            # 滑动窗口重叠比例
 
 # -----------------------------------------------------------------------------
-# 智能采样
+# 智能采样参数
 smart_sampling:
-  enabled: true
-  warmup_epochs: 5
-  base_tier1: 10
-  base_tier2: 30
-  max_tier1:  20
-  max_tier2:  60
-  enable_hard_mining:       true
-  enable_adaptive_density:  true
-  enable_importance_sampling: true
+  enabled: true         # 是否启用智能采样
+  warmup_epochs: 5      # 预热轮数，在此期间使用均匀采样
+  base_tier1: 10        # 基础Tier-1采样数量
+  base_tier2: 30        # 基础Tier-2采样数量
+  max_tier1: 20         # 最大Tier-1采样数量
+  max_tier2: 60         # 最大Tier-2采样数量
+  enable_hard_mining: true           # 是否启用硬样本挖掘
+  enable_adaptive_density: true      # 是否启用自适应采样密度
+  enable_importance_sampling: true   # 是否启用重要性采样
+  difficulty_maps_dir: "difficulty_maps"  # 难度图存储目录
+
+# -----------------------------------------------------------------------------
+# 训练和保存参数
+training:
+  epochs: 100           # 总训练轮数
+  batch_size: 1         # 批次大小
+  num_workers: 4        # 数据加载线程数
+  val_interval: 5       # 验证间隔（每多少轮验证一次）
+  save_interval: 10     # 保存间隔（每多少轮保存一次检查点）
+  seed: 42              # 随机种子
+
+# -----------------------------------------------------------------------------
+# 设备参数
+device: "cuda"          # 计算设备（"cuda"或"cpu"）
