@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from .dice_loss import DiceLoss, GeneralizedDiceLoss
-from .focal_loss import FocalLoss, BoundaryFocalLoss
+from .focal_loss import FocalLoss, AdaptiveBoundaryFocalLoss  # 修改这里导入新类
 
 
 class CombinedLoss(nn.Module):
@@ -11,10 +11,10 @@ class CombinedLoss(nn.Module):
 	def __init__(self, losses=None, weights=None):
 		"""
 		初始化组合损失
-
+ 
 		参数:
-			losses: 损失函数列表
-			weights: 每个损失函数的权重
+		   losses: 损失函数列表
+		   weights: 每个损失函数的权重
 		"""
 		super().__init__()
 		
@@ -32,13 +32,13 @@ class CombinedLoss(nn.Module):
 	def forward(self, pred, target):
 		"""
 		计算组合损失
-
+ 
 		参数:
-			pred: 预测值
-			target: 目标值
-
+		   pred: 预测值
+		   target: 目标值
+ 
 		返回:
-			组合损失值
+		   组合损失值
 		"""
 		# 计算每个损失函数的加权损失
 		total_loss = 0.0
@@ -64,12 +64,12 @@ class VesselSegmentationLoss(nn.Module):
 	def __init__(self, num_classes=2, vessel_weight=10.0, tumor_weight=15.0, use_boundary=True):
 		"""
 		初始化血管分割损失
-
+ 
 		参数:
-			num_classes: 分类数量 (1 = 二分类, >1 = 多分类)
-			vessel_weight: 血管类别的权重
-			tumor_weight: 肿瘤类别的权重 (如果num_classes > 2)
-			use_boundary: 是否使用边界增强损失
+		   num_classes: 分类数量 (1 = 二分类, >1 = 多分类)
+		   vessel_weight: 血管类别的权重
+		   tumor_weight: 肿瘤类别的权重 (如果num_classes > 2)
+		   use_boundary: 是否使用边界增强损失
 		"""
 		super().__init__()
 		
@@ -84,7 +84,13 @@ class VesselSegmentationLoss(nn.Module):
 			focal_loss = FocalLoss(alpha=0.25, gamma=2.0)
 			
 			if use_boundary:
-				boundary_loss = BoundaryFocalLoss(alpha=0.25, gamma=2.0, boundary_weight=3.0)
+				# 使用新的自适应边界损失
+				boundary_loss = AdaptiveBoundaryFocalLoss(
+					alpha=0.25,
+					gamma=2.0,
+					boundary_weight=3.0,
+					kernel_sizes=[3, 5]  # 使用多尺度边界检测
+				)
 				self.combined_loss = CombinedLoss(
 					[dice_loss, focal_loss, boundary_loss],
 					[0.4, 0.3, 0.3]
@@ -112,7 +118,13 @@ class VesselSegmentationLoss(nn.Module):
 			focal_loss = FocalLoss(alpha=alphas, gamma=2.0)
 			
 			if use_boundary:
-				boundary_loss = BoundaryFocalLoss(alpha=0.25, gamma=2.0, boundary_weight=3.0)
+				# 多类别情况下也使用自适应边界损失
+				boundary_loss = AdaptiveBoundaryFocalLoss(
+					alpha=0.25,
+					gamma=2.0,
+					boundary_weight=3.0,
+					kernel_sizes=[3, 5]
+				)
 				self.combined_loss = CombinedLoss(
 					[dice_loss, focal_loss, boundary_loss],
 					[0.4, 0.3, 0.3]
@@ -126,13 +138,13 @@ class VesselSegmentationLoss(nn.Module):
 	def forward(self, pred, target):
 		"""
 		计算血管分割损失
-
+ 
 		参数:
-			pred: 预测值 [B, C, D, H, W]
-			target: 目标值 [B, D, H, W]
-
+		   pred: 预测值 [B, C, D, H, W]
+		   target: 目标值 [B, D, H, W]
+ 
 		返回:
-			损失值
+		   损失值
 		"""
 		return self.combined_loss(pred, target)
 	
