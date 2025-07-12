@@ -1,150 +1,169 @@
 # =============================================================================
-# 完整的TA-CHNet训练配置文件
+# Optimized TA-CHNet Pipeline-Parallel Training Configuration
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# 数据参数
-max_cases: 2                   # 训练集最大案例数
-max_val_cases: 1                # 验证集最大案例数
-random_sampling: true           # 是否随机采样案例
+# Data parameters
+max_cases: 2
+max_val_cases: 2               # Increased for more robust validation
+random_sampling: true          # Random sampling for better generalization
 
 # -----------------------------------------------------------------------------
-# CH-Branch 参数
+# ROI
+preprocessing:
+  roi_threshold: 0.8           # 固定阈值方式
+  roi_percentile: 99.5         # 百分位数方式（二选一）
+  use_largest_cc: true         # 是否保留最大连通区域
+
+# -----------------------------------------------------------------------------
+# CH-Branch parameters
 ch_params:
-  max_n: 3                      # 最大角谐波阶数
-  max_k: 4                      # 最大径向阶数
-  max_l: 5                      # 最大轴向阶数
-  cylindrical_dims: [32, 36, 32]  # 柱坐标维度 [r, theta, z]
+  max_n: 3                      # Maximum angular harmonic order
+  max_k: 4                      # Maximum radial order
+  max_l: 5                      # Maximum axial order
+  cylindrical_dims: [32, 36, 32]  # Cylindrical coordinate dimensions [r, theta, z]
 
 # -----------------------------------------------------------------------------
-# Tier-specific 参数
+# Tier-specific parameters
 tier_params:
-  0:  # 器官级别
+  0:  # Organ level
     max_n: 2
     max_k: 3
     max_l: 4
     r_scale: 1.0
-  1:  # 结构级别
+  1:  # Structure level
     max_n: 3
     max_k: 4
     max_l: 5
     r_scale: 1.5
-  2:  # 细节级别
+  2:  # Detail level
     max_n: 4
     max_k: 5
     max_l: 6
     r_scale: 2.0
 
 # -----------------------------------------------------------------------------
-# 优化器参数
+# Pipeline parallelism parameters (NEW)
+pipeline:
+  enabled: true                  # Enable pipeline parallelism
+  micro_batch_size: 1            # Micro-batch size for pipeline processing
+  activation_checkpointing: true  # Enable activation checkpointing to save memory
+  overlap_communication: true     # Overlap computation and communication
+  recompute_activation: true      # Recompute activations to save memory
+
+  # Stage-specific parameters
+  stages:
+    frontend:
+      device: 'cuda:0'           # Frontend processing stage
+      buffer_size: 2             # Number of batches to buffer
+
+    ch_processing:
+      device: 'cuda:1'           # CH processing stage
+      buffer_size: 2
+
+    spatial_fusion:
+      device: 'cuda:2'           # Spatial processing and fusion stage
+      buffer_size: 2
+
+    backend:
+      device: 'cuda:3'           # Backend processing stage
+      buffer_size: 2
+
+# -----------------------------------------------------------------------------
+# Optimizer parameters
 optimizer:
-  base_lr: 1.0e-4               # 主干学习率
-  kernel_lr_scale: 0.1          # EdgeEnhancement.kernels学习率缩放比例
-  weight_decay: 1.0e-5          # 权重衰减
+  type: 'AdamW'                  # Changed from Adam to AdamW for better generalization
+  base_lr: 2.0e-4                # Increased learning rate for pipeline training
+  kernel_lr_scale: 0.1           # EdgeEnhancement.kernels learning rate scale
+  weight_decay: 2.0e-5           # Slightly increased weight decay
+
+  # Learning rate schedule (NEW)
+  lr_schedule:
+    type: 'cosine'               # Cosine annealing schedule
+    warmup_epochs: 5             # Warmup epochs
+    min_lr_factor: 0.01          # Minimum learning rate factor
 
 # -----------------------------------------------------------------------------
-# 混合精度和内存布局
-amp: true                       # 是否启用自动混合精度
-channels_last: true             # 是否使用channels_last内存格式
+# Mixed precision and memory layout
+amp: true                        # Enable automatic mixed precision
+amp_opt_level: 'O1'              # AMP optimization level
+channels_last: true              # Use channels_last memory format
+gradient_accumulation_steps: 2   # Accumulate gradients over multiple batches
 
 # -----------------------------------------------------------------------------
-# 损失函数参数
-vessel_weight: 10.0             # 血管类别权重
-tumor_weight: 15.0              # 肿瘤类别权重
-use_boundary: true              # 是否使用边界增强损失
+# Loss function parameters
+vessel_weight: 10.0              # Vessel class weight
+tumor_weight: 15.0               # Tumor class weight
+use_boundary: true               # Use boundary enhancement loss
+focal_gamma: 2.0                 # Focal loss gamma parameter
 
 # -----------------------------------------------------------------------------
-# Spatial Branch参数
-spatial_out_channels: 16        # SpatialFeatureExtractor输出通道数
+# Spatial Branch parameters
+spatial_out_channels: 16         # SpatialFeatureExtractor output channels
 
 # -----------------------------------------------------------------------------
-# Edge-Enhancement模块参数
+# Edge-Enhancement module parameters
 edge:
-  use: true                     # 是否使用边缘增强
-  out_channels: 8               # 边缘增强输出通道数
+  use: true                      # Use edge enhancement
+  out_channels: 8                # Edge enhancement output channels
 
 # -----------------------------------------------------------------------------
-# 推理参数
-window_size: 64                 # 滑动窗口大小
-overlap: 0.5                    # 滑动窗口重叠比例
+# Inference parameters
+window_size: 64                  # Sliding window size
+overlap: 0.5                     # Sliding window overlap ratio
 
 # -----------------------------------------------------------------------------
-# 智能采样参数
+# Smart sampling parameters
 smart_sampling:
-  enabled: true                 # 是否启用智能采样
-  warmup_epochs: 5              # 预热轮数，在此期间使用均匀采样
-  base_tier1: 10                # 基础Tier-1采样数量
-  base_tier2: 30                # 基础Tier-2采样数量
-  max_tier1: 20                 # 最大Tier-1采样数量
-  max_tier2: 60                 # 最大Tier-2采样数量
-  enable_hard_mining: true      # 是否启用硬样本挖掘
-  enable_adaptive_density: true # 是否启用自适应采样密度
-  enable_importance_sampling: true  # 是否启用重要性采样
-  difficulty_maps_dir: "difficulty_maps"  # 难度图存储目录
+  enabled: true                  # Enable smart sampling
+  warmup_epochs: 5               # Warmup epochs
+  base_tier1: 10                 # Increased base Tier-1 sampling count
+  base_tier2: 10                 # Increased base Tier-2 sampling count
+  max_tier1: 15                  # Increased max Tier-1 sampling count
+  max_tier2: 20                  # Increased max Tier-2 sampling count
+  enable_hard_mining: true       # Enable hard sample mining
+  enable_adaptive_density: true  # Enable adaptive sampling density
+  enable_importance_sampling: true  # Enable importance sampling
+  difficulty_maps_dir: "difficulty_maps"  # Difficulty map storage directory
+  update_interval: 2             # Update difficulty maps every N epochs
 
 # -----------------------------------------------------------------------------
-# 评估参数
+# Evaluation parameters
 evaluation:
-  # 基本评估间隔
-  eval_full_interval: 3        # 每10个epoch进行完整评估
-  eval_quick_interval: 1        # 每2个epoch进行快速评估
-  quick_samples: 1              # 快速评估使用的样本数
-
-  # 多tier评估设置
-  group_by_tier: true           # 按tier分组计算指标
-
-  # 内存映射设置（用于大规模评估）
-  feature_mmap_enabled: True   # 默认关闭，大数据集时可开启
+  eval_full_interval: 5          # Full evaluation interval
+  eval_quick_interval: 1         # Quick evaluation interval
+  quick_samples: 2               # Quick evaluation sample count
+  group_by_tier: true            # Group metrics by tier
+  feature_mmap_enabled: true     # Enable feature memory mapping
   feature_mmap_dir: "eval_tier_features"
-  clear_cache_interval: 3       # 每3个批次清理一次缓存
-
-  # 性能优化
-  max_eval_samples: 5          # 完整评估的最大样本数
-  eval_batch_size: 1            # 评估批次大小
-
-  # 指标计算设置
-  include_advanced_metrics: True  # 是否包含高级指标（如Hausdorff距离）
-  save_predictions: false       # 是否保存预测结果
-
-  # 可视化设置
-  visualize_samples: 3          # 可视化的样本数量
-  save_visualizations: false     # 是否保存可视化结果
+  clear_cache_interval: 3        # Cache clearing interval
+  max_eval_samples: 10           # Increased max evaluation samples
+  eval_batch_size: 1             # Evaluation batch size
+  include_advanced_metrics: true # Include advanced metrics
+  save_predictions: false        # Save predictions
+  visualize_samples: 3           # Visualization sample count
+  save_visualizations: false     # Save visualizations
 
 # -----------------------------------------------------------------------------
-# 训练和保存参数
+# Training and saving parameters
 training:
-  epochs: 100                   # 总训练轮数
-  batch_size: 1                 # 批次大小
-  num_workers: 4                # 数据加载线程数
-  val_interval: 5               # 验证间隔（每多少轮验证一次）
-  save_interval: 10             # 保存间隔（每多少轮保存一次检查点）
-  seed: 42                      # 随机种子
+  epochs: 10                  # Total training epochs
+  batch_size: 1                  # Batch size
+  num_workers: 8                 # Increased worker count for better data loading
+  val_interval: 5                # Validation interval
+  save_interval: 10              # Checkpoint saving interval
+  seed: 42                       # Random seed
 
 # -----------------------------------------------------------------------------
-# 设备参数
-device: "cuda"                  # 计算设备（"cuda"或"cpu"）
+# Device parameters
+device: "cuda"                   # Compute device
 
 # -----------------------------------------------------------------------------
-# 分布式训练参数（可选）
-distributed:
-  backend: 'nccl'               # 后端类型
-  init_method: 'env://'         # 初始化方法
-  sync_bn: true                 # 是否使用同步批归一化
-  find_unused_parameters: true  # 查找未使用参数
-  grad_accumulation: 1          # 梯度累积步数
-
-# -----------------------------------------------------------------------------
-# 日志和可视化参数
-logging:
-  log_interval: 10              # 日志记录间隔（批次）
-  tensorboard: true             # 启用TensorBoard
-  visualize_interval: 100       # 可视化间隔（批次）
-  sample_images: 4              # 可视化样本数量
-
-# -----------------------------------------------------------------------------
-# 检查点参数
+# Checkpoint parameters
 checkpoint:
-  save_interval: 5              # 保存间隔（轮数）
-  keep_best: true               # 保留最佳模型
-  keep_last: 3                  # 保留最近的N个检查点
-  metric: 'dice'                # 用于保存最佳模型的指标
+  save_interval: 5               # Save interval
+  keep_best: true                # Keep best model
+  keep_last: 3                   # Keep last N checkpoints
+  metric: 'dice'                 # Metric for best model
+  save_optimizer: true           # Save optimizer state
+  load_stage_to_gpu: true        # Load each stage directly to its assigned GPU

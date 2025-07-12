@@ -58,7 +58,7 @@ class VesselSegmenter(nn.Module):
 		self.attention_fusion = AttentionFusion()  # lazy inside
 		self.multiscale_fusion = MultiscaleFusion()  # lazy inside
 		
-		self.seg_head_first: nn.Conv3d | None = None  # lazy build on first forward
+		self.seg_head_first = nn.Conv3d(16, 32, 3, padding=1, bias=False)
 		self.seg_head_tail = nn.Sequential(
 			nn.InstanceNorm3d(32),
 			nn.ReLU(inplace=True),

@@ -9,7 +9,8 @@ from utils.logger import Logger  # 统一使用项目的Logger
 class CTPreprocessor:
 	"""CT图像预处理类，提供归一化和ROI提取功能，支持GPU加速"""
 	
-	def __init__(self, clip_percentiles=(0.5, 99.5), device='cuda', logger=None):
+	def __init__(self, clip_percentiles=(0.5, 99.5), roi_threshold=None, roi_percentile=99.8,
+	             use_largest_cc=True, device='cuda', logger=None):
 		"""
 		初始化预处理器
 
@@ -19,6 +20,10 @@ class CTPreprocessor:
 			logger: 日志记录器实例，应为utils.Logger的实例
 		"""
 		self.clip_percentiles = clip_percentiles
+		self.clip_percentiles = clip_percentiles
+		self.roi_threshold = roi_threshold
+		self.roi_percentile = roi_percentile
+		self.use_largest_cc = use_largest_cc
 		self.device = device if torch.cuda.is_available() and 'cuda' in device else 'cpu'
 		self.logger = logger
 		
@@ -92,18 +97,25 @@ class CTPreprocessor:
 		
 		return result
 	
-	def extract_liver_roi(self, volume, threshold=None, largest_cc=True):
+	def extract_liver_roi(self, volume, threshold=None, largest_cc=None):
 		"""
 		提取肝脏ROI，带缓存以避免重复计算
 
 		参数:
 			volume: 输入体积数据
-			threshold: 阈值，如果为None则使用99.8%百分位数
-			largest_cc: 是否只保留最大连通区域
+			threshold: 阈值，如果为None则使用实例变量
+			largest_cc: 是否只保留最大连通区域，如果为None则使用实例变量
 
 		返回:
 			肝脏掩码
 		"""
+		# 使用实例变量作为默认值
+		if threshold is None:
+			threshold = self.roi_threshold
+		
+		if largest_cc is None:
+			largest_cc = self.use_largest_cc
+		
 		# 检查是否可以使用缓存
 		volume_hash = hash(volume.tobytes()) if hasattr(volume, 'tobytes') else None
 		if volume_hash == self.last_volume_hash and threshold == self.last_threshold and self.last_roi is not None:
@@ -111,9 +123,9 @@ class CTPreprocessor:
 				self.logger.log_info(f"Using cached liver ROI")
 			return self.last_roi
 		
-		# 自动计算阈值
+		# 自动计算阈值（如果未提供固定阈值）
 		if threshold is None:
-			threshold = np.percentile(volume, 99.8)
+			threshold = np.percentile(volume, self.roi_percentile)
 		
 		# 阈值分割
 		binary = volume > threshold
@@ -140,6 +152,11 @@ class CTPreprocessor:
 			self.logger.log_info(f"ROI volume: {np.sum(binary)} voxels")
 		
 		return binary
+	
+	
+	
+	
+	
 	
 	def apply_windowing(self, volume, window_center, window_width):
 		"""

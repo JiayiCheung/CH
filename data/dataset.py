@@ -14,11 +14,9 @@ from .tier_sampling import TierSampler
 class LiverVesselDataset(Dataset):
 	"""肝脏血管分割数据集，支持智能采样和硬样本挖掘"""
 	
-	def __init__(self, image_dir, label_dir, tier=None, transform=None,
-	             preprocess=True, max_cases=None, random_sampling=True,
-	             enable_smart_sampling=True, sampling_params=None,
-	             hard_sample_tracker=None, difficulty_maps_dir="difficulty_maps",
-	             logger=None):
+	def __init__(self, image_dir, label_dir, tier=None, transform=None, preprocess=True,
+	             max_cases=None, random_sampling=True, enable_smart_sampling=False,
+	             sampling_params=None, hard_sample_tracker=None, logger=None, config=None):
 		"""
 		初始化数据集
 
@@ -45,8 +43,24 @@ class LiverVesselDataset(Dataset):
 		self.logger = logger
 		
 		# 初始化预处理器和采样器
-		self.preprocessor = CTPreprocessor(logger=logger) if preprocess else None
 		self.sampler = TierSampler(logger=logger)
+		self.config = config or {}
+		# 初始化预处理器和采样器
+		if preprocess:
+			# 获取预处理配置
+			preprocessing_config = self.config.get('preprocessing', {})
+			
+			# 创建预处理器，从配置文件获取参数
+			self.preprocessor = CTPreprocessor(
+				clip_percentiles=preprocessing_config.get('clip_percentiles', (0.5, 99.5)),
+				roi_threshold=preprocessing_config.get('roi_threshold',0.8),
+				roi_percentile=preprocessing_config.get('roi_percentile', 99.8),
+				use_largest_cc=preprocessing_config.get('use_largest_cc', True),
+				device='cuda' if torch.cuda.is_available() else 'cpu',
+				logger=logger
+			)
+		
+		
 		
 		# 初始化采样参数
 		self.sampling_params = sampling_params or {
@@ -73,6 +87,8 @@ class LiverVesselDataset(Dataset):
 		# 打印初始统计
 		if logger:
 			logger.log_info(f"初始化完成，数据集包含 {len(self.patches)} 个样本")
+		
+		
 	
 	def _load_file_list(self, max_cases, random_sampling):
 		"""加载文件列表"""
