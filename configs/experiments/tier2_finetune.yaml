@@ -1,0 +1,31 @@
+# Tier-2微调配置
+
+# 数据参数
+max_cases: 10
+max_val_cases: 5
+random_sampling: true
+
+# 模型参数
+ch_params:
+  max_n: 4
+  max_k: 5
+  max_l: 6
+  cylindrical_dims: [32, 36, 32]
+
+# Tier特定参数
+tier_params:
+  2:  # 细节级别
+    max_n: 4
+    max_k: 5
+    max_l: 6
+    r_scale: 2.0
+
+# 训练参数
+vessel_weight: 15.0
+tumor_weight: 18.0
+use_boundary: true
+weight_decay: 5e-6
+
+# 推理参数
+window_size: 48
+overlap: 0.65

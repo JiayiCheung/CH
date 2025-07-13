@@ -1,0 +1,31 @@
+# Tier-0预训练配置
+
+# 数据参数
+max_cases: 20
+max_val_cases: 5
+random_sampling: true
+
+# 模型参数
+ch_params:
+  max_n: 2
+  max_k: 3
+  max_l: 4
+  cylindrical_dims: [32, 36, 32]
+
+# Tier特定参数
+tier_params:
+  0:  # 器官级别
+    max_n: 2
+    max_k: 3
+    max_l: 4
+    r_scale: 1.0
+
+# 训练参数
+vessel_weight: 10.0
+tumor_weight: 15.0
+use_boundary: true
+weight_decay: 1e-5
+
+# 推理参数
+window_size: 64
+overlap: 0.5
