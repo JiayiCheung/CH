@@ -6,7 +6,7 @@ from pathlib import Path
 
 # 导入模型相关组件
 from models import VesselSegmenter
-from losses import VesselSegmentationLoss
+from loss import VesselSegmentationLoss
 from data.sampling_manager import SamplingManager
 from utils import Logger
 

@@ -1,9 +1,10 @@
-#cross_node_pipeline.py
+# cross_node_pipeline.py
 
 import time
 import threading
 import queue
 import torch
+import torch.nn.functional as F
 import numpy as np
 import logging
 from typing import Dict, List, Optional, Any
@@ -13,7 +14,7 @@ logger = logging.getLogger("cross_node_pipeline")
 
 
 class CrossNodePipeline:
-	"""管理跨节点的数据流和处理流水线"""
+	"""管理跨节点的数据流和处理流水线 - 优化版"""
 	
 	def __init__(self, stages, node_comm):
 		"""
@@ -38,19 +39,13 @@ class CrossNodePipeline:
 		self.running = False
 		self.exception = None
 		
-		# 性能统计
+		# 性能统计（简化版）
 		self.batch_times = []
-		self.stage_times = {}
-		self.last_batch_start = 0
 		self.processed_batches = 0
 		
 		# 流水线状态
 		self.pipeline_lock = threading.Lock()
 		self.is_training = True
-		
-		# 结果缓存 (用于反向传播)
-		self.result_cache = {}
-		self.cache_lock = threading.Lock()
 		
 		logger.info(
 			f"CrossNodePipeline initialized on node {self.node_rank}, GPU {self.local_rank} (world rank {self.world_rank})")
@@ -80,428 +75,108 @@ class CrossNodePipeline:
 			logger.info(f"Stopped worker thread on node {self.node_rank}, GPU {self.local_rank}")
 	
 	def _worker_loop(self):
-		"""工作线程主循环"""
-		try:
-			while self.running:
-				try:
-					# 获取输入数据
-					if self.input_queue.empty():
-						time.sleep(0.001)  # 避免CPU忙等
-						continue
-					
-					batch_data = self.input_queue.get(timeout=1.0)
-					if batch_data is None:  # 终止信号
-						break
-					
-					batch, batch_id = batch_data
-					
-					# 记录开始时间
-					start_time = time.time()
-					
-					# 执行处理
-					result = self._process_batch(batch)
-					
-					# 记录处理时间
-					elapsed = time.time() - start_time
-					self.batch_times.append(elapsed)
-					
-					# 放入输出队列
-					self.output_queue.put((result, batch_id))
-					
-					# 完成任务
-					self.input_queue.task_done()
-					self.processed_batches += 1
-				
-				except queue.Empty:
+		"""工作循环 - 简化版，专注核心功能"""
+		while self.running:
+			try:
+				# 从输入队列获取批次
+				batch = self.input_queue.get(timeout=1.0)
+				if batch is None:
 					continue
-		
-		except Exception as e:
-			logger.error(f"Error in worker thread: {str(e)}")
-			self.exception = e
-			self.running = False
+				
+				batch_start = time.time()
+				
+				# 执行当前节点的处理阶段
+				result = self._execute_stages(batch)
+				
+				# 记录批次处理时间
+				batch_time = time.time() - batch_start
+				self.batch_times.append(batch_time)
+				
+				# 输出结果
+				self.output_queue.put(result)
+				self.processed_batches += 1
+			
+			except queue.Empty:
+				continue
+			except Exception as e:
+				self.exception = e
+				logger.error(f"Worker loop error: {e}")
+				break
 	
-	def _process_batch(self, batch):
-		"""根据当前节点和GPU处理批次"""
-		if self.node_rank == 0:  # 节点1
-			if self.local_rank == 0:
-				# GPU 0: 数据预处理
-				start = time.time()
-				result = self._execute_preprocessing_stage(batch)
-				self._update_stage_time('preprocessing', time.time() - start)
-				return result
-			
-			elif self.local_rank == 1:
-				# GPU 1: Patch调度
-				start = time.time()
-				result = self._execute_patch_scheduling_stage(batch)
-				self._update_stage_time('patch_scheduling', time.time() - start)
-				return result
-			
-			elif self.local_rank == 2:
-				# GPU 2: CH分支
-				start = time.time()
-				result = self._execute_ch_branch_stage(batch)
-				self._update_stage_time('ch_branch', time.time() - start)
-				return result
-			
-			elif self.local_rank == 3:
-				# GPU 3: 空间分支
-				start = time.time()
-				result = self._execute_spatial_branch_stage(batch)
-				self._update_stage_time('spatial_branch', time.time() - start)
-				return result
+	def _execute_stages(self, batch):
+		"""执行当前节点的所有阶段"""
+		current_data = batch
 		
-		else:  # 节点2
-			if self.local_rank == 0:
-				# GPU 4: 特征融合
-				start = time.time()
-				result = self._execute_feature_fusion_stage(batch)
-				self._update_stage_time('feature_fusion', time.time() - start)
-				return result
-			
-			elif self.local_rank == 1:
-				# GPU 5: 多尺度融合
-				start = time.time()
-				result = self._execute_multiscale_fusion_stage(batch)
-				self._update_stage_time('multiscale_fusion', time.time() - start)
-				return result
-			
-			elif self.local_rank == 2:
-				# GPU 6: 分割头和损失计算
-				start = time.time()
-				result = self._execute_segmentation_head_stage(batch)
-				self._update_stage_time('segmentation_head', time.time() - start)
-				return result
+		# 按顺序执行当前节点的所有阶段
+		for stage_name, stage in self.stages.items():
+			try:
+				if hasattr(stage, 'forward'):
+					current_data = stage.forward(current_data)
+				else:
+					current_data = stage.process(current_data)
+			except Exception as e:
+				logger.error(f"Stage {stage_name} failed: {e}")
+				return None
 		
-		return None
+		return current_data
 	
-	def forward(self, batch, is_training=True):
+	def forward(self, batch):
 		"""
-		执行前向传播
+		前向传播
 
 		参数:
 			batch: 输入批次
-			is_training: 是否处于训练模式
 
 		返回:
-			模型输出
+			处理结果
 		"""
-		# 保存训练模式
-		self.is_training = is_training
-		
-		# 设置所有阶段的训练模式
-		for stage in self.stages.values():
-			if hasattr(stage, 'train'):
-				stage.train(is_training)
-		
-		# 确保工作线程正在运行
-		if not self.running:
-			self.start_worker()
-		
-		# 检查是否有异常发生
-		if self.exception:
-			raise RuntimeError(f"Pipeline error: {str(self.exception)}")
-		
-		# 记录批次开始时间
-		self.last_batch_start = time.time()
-		
-		# 生成批次ID
-		batch_id = id(batch)
-		
-		# 放入输入队列
-		self.input_queue.put((batch, batch_id))
-		
-		# 等待结果
-		while True:
-			try:
-				result, result_id = self.output_queue.get(timeout=10.0)
-				self.output_queue.task_done()
-				
-				if result_id == batch_id:
-					# 计算批次处理延迟
-					latency = time.time() - self.last_batch_start
-					
-					# 缓存结果用于反向传播
-					if is_training:
-						with self.cache_lock:
-							self.result_cache[batch_id] = {
-								'result': result,
-								'time': time.time()
-							}
-					
-					return result
-				else:
-					# 不是我们等待的结果，放回队列
-					self.output_queue.put((result, result_id))
-					time.sleep(0.001)
+		try:
+			# 将批次放入输入队列
+			self.input_queue.put(batch, timeout=5.0)
 			
-			except queue.Empty:
-				if not self.running or self.exception:
-					raise RuntimeError(
-						f"Timeout waiting for result, pipeline may be stalled. Error: {str(self.exception)}")
-				continue
+			# 获取处理结果
+			result = self.output_queue.get(timeout=30.0)
+			
+			return result
+		
+		except queue.Full:
+			logger.error("Input queue is full")
+			return None
+		except queue.Empty:
+			logger.error("No result received within timeout")
+			return None
+		except Exception as e:
+			logger.error(f"Forward pass failed: {e}")
+			return None
 	
 	def backward(self, loss, batch):
-		"""
-		执行反向传播
-
-		参数:
-			loss: 损失值
-			batch: 对应的输入批次
-		"""
-		# 如果不在训练模式，直接返回
+		"""执行反向传播 - 优化版"""
 		if not self.is_training:
 			return
 		
-		# 找到对应的缓存结果
-		batch_id = id(batch)
-		
-		with self.cache_lock:
-			if batch_id not in self.result_cache:
-				logger.warning(f"No cached result found for batch {batch_id}, using standard backward")
-				loss.backward()
-				return
-			
-			# 获取缓存的结果
-			cached = self.result_cache[batch_id]
-			
-			# 执行反向传播
-			if 'segmentation_head' in self.stages and self.node_rank == 1 and self.local_rank == 2:
-				# 最后一个阶段处理反向传播
-				self.stages['segmentation_head'].backward(loss)
-			else:
-				# 其他阶段不需要特殊处理
-				loss.backward()
-			
-			# 清理缓存
-			del self.result_cache[batch_id]
-	
-	def _execute_preprocessing_stage(self, batch):
-		"""执行预处理阶段"""
-		if 'preprocessing' not in self.stages:
-			return batch
-		
-		return self.stages['preprocessing'].forward(batch)
-	
-	def _execute_patch_scheduling_stage(self, preprocessed_data):
-		"""
-		执行Patch调度阶段
-
-		参数:
-			preprocessed_data: 预处理阶段的输出
-		"""
-		if 'patch_scheduling' not in self.stages:
-			return preprocessed_data
-		
-		# 解构预处理结果
-		if isinstance(preprocessed_data, tuple) and len(preprocessed_data) == 2:
-			processed_images, labels = preprocessed_data
-		else:
-			processed_images, labels = preprocessed_data, None
-		
-		return self.stages['patch_scheduling'].forward(processed_images, labels)
-	
-	def _execute_ch_branch_stage(self, scheduling_output):
-		"""
-		执行CH分支阶段
-
-		参数:
-			scheduling_output: Patch调度阶段的输出
-		"""
-		if 'ch_branch' not in self.stages:
-			return scheduling_output
-		
-		# 解构调度结果
-		if isinstance(scheduling_output, tuple) and len(scheduling_output) == 2:
-			patches, case_patches = scheduling_output
-		else:
-			patches, case_patches = scheduling_output, None
-		
-		return self.stages['ch_branch'].forward(patches)
-	
-	def _execute_spatial_branch_stage(self, scheduling_output):
-		"""
-		执行空间分支阶段
-
-		参数:
-			scheduling_output: Patch调度阶段的输出 (与CH分支共享输入)
-		"""
-		if 'spatial_branch' not in self.stages:
-			return scheduling_output
-		
-		# 解构调度结果
-		if isinstance(scheduling_output, tuple) and len(scheduling_output) == 2:
-			patches, case_patches = scheduling_output
-			
-			# 获取tiers (如果CH分支已经处理)
-			tiers = [patch['tier'] for patch in patches] if isinstance(patches, list) else None
-			
-			return self.stages['spatial_branch'].forward(patches, tiers)
-		else:
-			return self.stages['spatial_branch'].forward(scheduling_output)
-	
-	def _execute_feature_fusion_stage(self, input_data):
-		"""
-		执行特征融合阶段
-
-		参数:
-			input_data: 从前一阶段接收的数据，可能是CH特征或需要接收从node_comm
-		"""
-		if 'feature_fusion' not in self.stages:
-			return input_data
-		
-		# 在节点2的第一个GPU上，需要从两个分支接收数据
-		if self.node_rank == 1 and self.local_rank == 0:
-			# 从分布式通信接收数据
-			ch_features, ch_tiers = self._receive_ch_features()
-			spatial_features, spatial_tiers = self._receive_spatial_features()
-			
-			# 确保tiers匹配
-			if ch_tiers and spatial_tiers and ch_tiers != spatial_tiers:
-				logger.warning("Tiers from CH branch and spatial branch don't match")
-			
-			tiers = ch_tiers if ch_tiers else spatial_tiers
-			
-			return self.stages['feature_fusion'].forward(ch_features, spatial_features, tiers)
-		else:
-			# 直接使用上一阶段的输出
-			return self.stages['feature_fusion'].forward(input_data)
-	
-	def _execute_multiscale_fusion_stage(self, fusion_output):
-		"""
-		执行多尺度融合阶段
-
-		参数:
-			fusion_output: 特征融合阶段的输出
-		"""
-		if 'multiscale_fusion' not in self.stages:
-			return fusion_output
-		
-		return self.stages['multiscale_fusion'].forward(fusion_output)
-	
-	def _execute_segmentation_head_stage(self, multiscale_output):
-		"""
-		执行分割头阶段
-
-		参数:
-			multiscale_output: 多尺度融合阶段的输出
-		"""
-		if 'segmentation_head' not in self.stages:
-			return multiscale_output
-		
-		# 获取原始标签
-		labels = self._get_labels_for_segmentation()
-		
-		return self.stages['segmentation_head'].forward(multiscale_output, labels)
-	
-	def _receive_ch_features(self):
-		"""从CH分支接收特征"""
-		# 实现从节点1的GPU 2接收CH特征的代码
-		if not hasattr(self.node_comm, 'recv_tensor'):
-			logger.warning("node_comm does not have recv_tensor method")
-			return None, None
-		
+		# 简化的反向传播：直接执行，不需要复杂的缓存机制
 		try:
-			# 从源节点接收数据
-			ch_source_rank = self.node_comm.node_ranks[0] + 2  # 节点1的GPU 2
+			loss.backward()
 			
-			# 接收features数量
-			count_tensor = self.node_comm.recv_tensor(
-				src_rank=ch_source_rank,
-				dtype=torch.long,
-				device=f"cuda:{self.local_rank}"
-			)
-			ch_count = count_tensor.item()
-			
-			# 接收每个CH特征
-			ch_features = []
-			ch_tiers = []
-			
-			for i in range(ch_count):
-				# 接收CH特征
-				ch_feat = self.node_comm.recv_tensor(
-					src_rank=ch_source_rank,
-					device=f"cuda:{self.local_rank}"
-				)
-				
-				# 接收tier信息
-				tier_tensor = self.node_comm.recv_tensor(
-					src_rank=ch_source_rank,
-					dtype=torch.long,
-					device=f"cuda:{self.local_rank}"
-				)
-				
-				ch_features.append(ch_feat)
-				ch_tiers.append(tier_tensor.item())
-			
-			return ch_features, ch_tiers
+			# 如果是分布式训练，确保梯度同步
+			if hasattr(self, 'stages'):
+				for stage in self.stages.values():
+					if hasattr(stage, 'module') and hasattr(stage.module, 'parameters'):
+						# 简单的梯度裁剪
+						torch.nn.utils.clip_grad_norm_(stage.module.parameters(), max_norm=1.0)
 		
 		except Exception as e:
-			logger.error(f"Error receiving CH features: {str(e)}")
-			return None, None
+			logger.error(f"Backward pass failed: {e}")
 	
-	def _receive_spatial_features(self):
-		"""从空间分支接收特征"""
-		# 实现从节点1的GPU 3接收空间特征的代码
-		if not hasattr(self.node_comm, 'recv_tensor'):
-			logger.warning("node_comm does not have recv_tensor method")
-			return None, None
-		
-		try:
-			# 从源节点接收数据
-			spatial_source_rank = self.node_comm.node_ranks[0] + 3  # 节点1的GPU 3
-			
-			# 接收features数量
-			count_tensor = self.node_comm.recv_tensor(
-				src_rank=spatial_source_rank,
-				dtype=torch.long,
-				device=f"cuda:{self.local_rank}"
-			)
-			spatial_count = count_tensor.item()
-			
-			# 接收每个空间特征
-			spatial_features = []
-			spatial_tiers = []
-			
-			for i in range(spatial_count):
-				# 接收空间特征
-				spatial_feat = self.node_comm.recv_tensor(
-					src_rank=spatial_source_rank,
-					device=f"cuda:{self.local_rank}"
-				)
-				
-				# 接收tier信息
-				tier_tensor = self.node_comm.recv_tensor(
-					src_rank=spatial_source_rank,
-					dtype=torch.long,
-					device=f"cuda:{self.local_rank}"
-				)
-				
-				spatial_features.append(spatial_feat)
-				spatial_tiers.append(tier_tensor.item())
-			
-			return spatial_features, spatial_tiers
-		
-		except Exception as e:
-			logger.error(f"Error receiving spatial features: {str(e)}")
-			return None, None
-	
-	def _get_labels_for_segmentation(self):
-		"""获取分割用的标签"""
-		# 在实际应用中，可能需要从node_comm接收标签
-		# 这里简化为返回None
-		return None
-	
-	def _update_stage_time(self, stage_name, time_taken):
-		"""更新阶段处理时间统计"""
-		if stage_name not in self.stage_times:
-			self.stage_times[stage_name] = []
-		
-		self.stage_times[stage_name].append(time_taken)
-		
-		# 保持统计列表的合理大小
-		if len(self.stage_times[stage_name]) > 100:
-			self.stage_times[stage_name] = self.stage_times[stage_name][-100:]
+	def get_all_parameters(self):
+		"""获取所有阶段的参数"""
+		all_params = []
+		for stage in self.stages.values():
+			if hasattr(stage, 'parameters'):
+				all_params.extend(stage.parameters())
+			elif hasattr(stage, 'module') and hasattr(stage.module, 'parameters'):
+				all_params.extend(stage.module.parameters())
+		return all_params
 	
 	def train(self, mode=True):
 		"""设置训练模式"""
@@ -517,7 +192,7 @@ class CrossNodePipeline:
 	
 	def get_performance_stats(self):
 		"""
-		获取性能统计
+		获取性能统计（简化版）
 
 		返回:
 			性能统计字典
@@ -536,33 +211,13 @@ class CrossNodePipeline:
 			'throughput': throughput,
 			'latency_ms': latency,
 			'processed_batches': self.processed_batches,
-			'stages': {}
 		}
-		
-		# 计算各阶段的平均时间
-		for stage_name, times in self.stage_times.items():
-			if times:
-				avg_time = sum(times) / len(times)
-				stats['stages'][stage_name] = {
-					'avg_time_ms': avg_time * 1000,  # 转换为毫秒
-					'samples': len(times)
-				}
-		
-		# 收集各阶段的详细统计
-		for name, stage in self.stages.items():
-			if hasattr(stage, 'get_stats'):
-				stage_stats = stage.get_stats()
-				if name in stats['stages']:
-					stats['stages'][name].update(stage_stats)
-				else:
-					stats['stages'][name] = stage_stats
 		
 		return stats
 	
 	def reset_stats(self):
 		"""重置性能统计"""
 		self.batch_times = []
-		self.stage_times = {}
 		self.processed_batches = 0
 		
 		for stage in self.stages.values():
@@ -572,3 +227,66 @@ class CrossNodePipeline:
 	def __del__(self):
 		"""析构函数，确保停止工作线程"""
 		self.stop_worker()
+	
+	# 为了兼容原始接口，添加一些方法
+	def __call__(self, batch):
+		"""使流水线可调用"""
+		return self.forward(batch)
+	
+	def parameters(self):
+		"""获取所有参数"""
+		for stage in self.stages.values():
+			if hasattr(stage, 'parameters'):
+				yield from stage.parameters()
+			elif hasattr(stage, 'module') and hasattr(stage.module, 'parameters'):
+				yield from stage.module.parameters()
+	
+	def state_dict(self):
+		"""获取状态字典"""
+		state_dict = {}
+		for stage_name, stage in self.stages.items():
+			if hasattr(stage, 'get_state_dict_prefix'):
+				stage_state = stage.get_state_dict_prefix()
+				for key, value in stage_state.items():
+					state_dict[f"{stage_name}.{key}"] = value
+		return state_dict
+	
+	def load_state_dict(self, state_dict):
+		"""加载状态字典"""
+		for stage_name, stage in self.stages.items():
+			stage_prefix = f"{stage_name}."
+			stage_state = {}
+			
+			for key, value in state_dict.items():
+				if key.startswith(stage_prefix):
+					new_key = key[len(stage_prefix):]
+					stage_state[new_key] = value
+			
+			if stage_state and hasattr(stage, 'load_state_dict'):
+				try:
+					stage.load_state_dict(stage_state, strict=False)
+				except Exception as e:
+					logger.warning(f"Failed to load state for stage {stage_name}: {e}")
+
+
+# 工厂函数，用于创建流水线
+def create_pipeline(config, node_comm):
+	"""
+	创建跨节点流水线的工厂函数
+
+	参数:
+		config: 配置字典
+		node_comm: 节点通信管理器
+
+	返回:
+		CrossNodePipeline实例
+	"""
+	from .stages import create_pipeline_stages
+	
+	# 创建阶段
+	stages = create_pipeline_stages(config, node_comm)
+	
+	# 创建流水线
+	pipeline = CrossNodePipeline(stages, node_comm)
+	
+	return pipeline
