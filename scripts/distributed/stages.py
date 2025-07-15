@@ -453,29 +453,37 @@ class CHProcessingStage(BaseStage):
 		processed_tiers = []
 		
 		for patch, tier in zip(patches, tiers):
-			# 1. 设置当前tier的CH参数
-			self.ch_branch.set_tier(tier)
-			
-			# 2. 获取tier特定的参数
-			tier_params = self.tier_params.get(tier, {})
-			r_scale = tier_params.get('r_scale', 1.0)
-			
-			# 3. 执行CH变换
 			try:
-				# 确保输入是张量格式
+				# 1. 设置当前tier的CH参数
+				if hasattr(self.ch_branch, 'set_tier'):
+					self.ch_branch.set_tier(tier)
+				
+				# 2. 获取tier特定的参数
+				tier_params = self.tier_params.get(tier, {})
+				r_scale = tier_params.get('r_scale', 1.0)
+				
+				# 3. 确保输入是张量格式
 				if isinstance(patch, np.ndarray):
 					patch_tensor = torch.from_numpy(patch).float().unsqueeze(0).to(self.device)
 				else:
 					patch_tensor = patch.to(self.device)
 				
-				# CH分支前向传播
-				ch_output = self.ch_branch(patch_tensor, r_scale=r_scale)
+				# 4. CH分支前向传播
+				if hasattr(self.ch_branch, '__call__'):
+					# 检查ch_branch是否支持r_scale参数
+					import inspect
+					sig = inspect.signature(self.ch_branch.forward)
+					if 'r_scale' in sig.parameters:
+						ch_output = self.ch_branch(patch_tensor, r_scale=r_scale)
+					else:
+						ch_output = self.ch_branch(patch_tensor)
+				else:
+					ch_output = patch_tensor  # 备用方案
 				
 				ch_features.append(ch_output)
 				processed_tiers.append(tier)
 			
 			except Exception as e:
-				# 简单跳过失败的patch，继续处理其他的
 				print(f"CH processing failed for tier {tier}: {e}")
 				continue
 		
@@ -483,6 +491,7 @@ class CHProcessingStage(BaseStage):
 		self.batch_count += len(patches)
 		
 		return ch_features, processed_tiers
+	
 	
 	def forward(self, patches=None, tiers=None):
 		"""同步前向处理 - 优化版"""

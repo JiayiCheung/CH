@@ -189,8 +189,19 @@ def create_pipeline_stages(config, rank, device):
 
 def create_distributed_model(config, rank, device):
 	"""创建分布式模型"""
-	# 创建节点通信
-	node_comm = NodeCommunicator()
+	# 获取分布式环境参数
+	world_size = torch.distributed.get_world_size()
+	local_rank = int(os.environ.get('LOCAL_RANK', 0))
+	node_rank = rank // 4  # 每节点4个GPU
+	
+	# 正确传递参数给NodeCommunicator
+	node_comm = NodeCommunicator(
+		world_size=world_size,
+		rank=rank,
+		local_rank=local_rank,
+		node_rank=node_rank,
+		node_count=2  # 2个节点
+	)
 	
 	# 创建流水线阶段
 	stages = create_pipeline_stages(config, rank, device)
@@ -203,6 +214,7 @@ def create_distributed_model(config, rank, device):
 	pipeline.start_worker()
 	
 	return pipeline
+
 
 
 def create_loss_function(config):
