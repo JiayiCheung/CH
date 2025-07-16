@@ -82,37 +82,21 @@ class CHTransform(nn.Module):
 	
 	def _bessel_j_approx(self, n, x):
 		"""
-		Bessel函数的近似计算
-
-		参数:
-			n: 阶数
-			x: 输入值（张量）
-
-		返回:
-			Bessel函数值的近似
+		Bessel函数的近似计算 - 修正版
 		"""
-		# 实现简化的Bessel函数近似
-		# 对于实际实现，应该使用更精确的方法
-		
 		if n == 0:
 			# J_0(x)的近似
 			small_x = (x.abs() < 1.0)
-			medium_x = ((x.abs() >= 1.0) & (x.abs() < 5.0))
-			large_x = (x.abs() >= 5.0)
+			large_x = (x.abs() >= 1.0)
 			
 			result = torch.zeros_like(x)
 			
-			# 小x近似
+			# 小x近似 (Taylor展开)
 			if small_x.any():
 				x_small = x[small_x]
-				result[small_x] = 1 - (x_small ** 2) / 4 + (x_small ** 4) / 64
+				result[small_x] = 1 - (x_small ** 2) / 4 + (x_small ** 4) / 64 - (x_small ** 6) / 2304
 			
-			# 中等x近似
-			if medium_x.any():
-				x_med = x[medium_x]
-				result[medium_x] = torch.cos(x_med - torch.pi / 4) / torch.sqrt(x_med)
-			
-			# 大x近似
+			# 大x渐近展开
 			if large_x.any():
 				x_large = x[large_x]
 				factor = torch.sqrt(2 / (torch.pi * x_large))
@@ -124,22 +108,16 @@ class CHTransform(nn.Module):
 		elif n == 1:
 			# J_1(x)的近似
 			small_x = (x.abs() < 1.0)
-			medium_x = ((x.abs() >= 1.0) & (x.abs() < 5.0))
-			large_x = (x.abs() >= 5.0)
+			large_x = (x.abs() >= 1.0)
 			
 			result = torch.zeros_like(x)
 			
 			# 小x近似
 			if small_x.any():
 				x_small = x[small_x]
-				result[small_x] = x_small / 2 - (x_small ** 3) / 16
+				result[small_x] = x_small / 2 - (x_small ** 3) / 16 + (x_small ** 5) / 384
 			
-			# 中等x近似
-			if medium_x.any():
-				x_med = x[medium_x]
-				result[medium_x] = torch.sin(x_med - torch.pi / 4) / torch.sqrt(x_med)
-			
-			# 大x近似
+			# 大x渐近展开
 			if large_x.any():
 				x_large = x[large_x]
 				factor = torch.sqrt(2 / (torch.pi * x_large))
@@ -149,21 +127,21 @@ class CHTransform(nn.Module):
 			return result
 		
 		else:
-			# 更高阶的近似
+			# 高阶Bessel函数
 			small_x = (x.abs() < 0.1 * n)
 			large_x = ~small_x
 			
 			result = torch.zeros_like(x)
 			
-			# 小x近似
+			# 小x近似: J_n(x) ≈ (x/2)^n / n!
 			if small_x.any():
 				x_small = x[small_x]
-				# J_n(x) ≈ (x/2)^n / n! for small x
-				log_term = n * torch.log(x_small / 2) - torch.tensor(sum(math.log(i) for i in range(1, n + 1)),
-				                                                     device=x.device)
+				# 用log避免数值溢出
+				log_factorial = sum(math.log(i) for i in range(1, n + 1))
+				log_term = n * torch.log(x_small / 2) - log_factorial
 				result[small_x] = torch.exp(log_term)
 			
-			# 大x近似
+			# 大x渐近展开
 			if large_x.any():
 				x_large = x[large_x]
 				factor = torch.sqrt(2 / (torch.pi * x_large))
@@ -171,6 +149,10 @@ class CHTransform(nn.Module):
 				result[large_x] = factor * torch.cos(phase)
 			
 			return result
+		
+		
+		
+		
 	
 	def decompose(self, cylindrical_volume, r_scale=1.0):
 		"""
