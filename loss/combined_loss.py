@@ -24,7 +24,7 @@ class CombinedLoss(nn.Module):
 				DiceLoss(squared=True),
 				FocalLoss(alpha=0.25, gamma=2.0)
 			]
-			self.weights = [0.5, 0.5]
+			self.weights = [0.7, 0.3]
 		else:
 			self.losses = losses
 			self.weights = weights if weights is not None else [1.0 / len(losses)] * len(losses)
@@ -58,96 +58,3 @@ class CombinedLoss(nn.Module):
 		return total_loss
 
 
-class VesselSegmentationLoss(nn.Module):
-	"""专为血管分割设计的损失函数"""
-	
-	def __init__(self, num_classes=2, vessel_weight=10.0, tumor_weight=15.0, use_boundary=True):
-		"""
-		初始化血管分割损失
- 
-		参数:
-		   num_classes: 分类数量 (1 = 二分类, >1 = 多分类)
-		   vessel_weight: 血管类别的权重
-		   tumor_weight: 肿瘤类别的权重 (如果num_classes > 2)
-		   use_boundary: 是否使用边界增强损失
-		"""
-		super().__init__()
-		
-		self.num_classes = num_classes
-		self.vessel_weight = vessel_weight
-		self.tumor_weight = tumor_weight
-		self.use_boundary = use_boundary
-		
-		# 设置损失函数组合
-		if num_classes == 1:  # 二分类
-			dice_loss = DiceLoss(squared=True)
-			focal_loss = FocalLoss(alpha=0.25, gamma=2.0)
-			
-			if use_boundary:
-				# 使用新的自适应边界损失
-				boundary_loss = AdaptiveBoundaryFocalLoss(
-					alpha=0.25,
-					gamma=2.0,
-					boundary_weight=3.0,
-					kernel_sizes=[3, 5]  # 使用多尺度边界检测
-				)
-				self.combined_loss = CombinedLoss(
-					[dice_loss, focal_loss, boundary_loss],
-					[0.4, 0.3, 0.3]
-				)
-			else:
-				self.combined_loss = CombinedLoss(
-					[dice_loss, focal_loss],
-					[0.5, 0.5]
-				)
-		else:  # 多分类
-			# 使用广义Dice损失处理多类别
-			dice_loss = GeneralizedDiceLoss()
-			
-			# 对于多类别，alpha需要是类别权重列表
-			alphas = [0.1]  # 背景权重
-			alphas.append(vessel_weight / (vessel_weight + tumor_weight + 0.1))  # 血管权重
-			
-			if num_classes > 2:
-				alphas.append(tumor_weight / (vessel_weight + tumor_weight + 0.1))  # 肿瘤权重
-			
-			# 填充其他类别权重 (如果有)
-			while len(alphas) < num_classes:
-				alphas.append(0.1)
-			
-			focal_loss = FocalLoss(alpha=alphas, gamma=2.0)
-			
-			if use_boundary:
-				# 多类别情况下也使用自适应边界损失
-				boundary_loss = AdaptiveBoundaryFocalLoss(
-					alpha=0.25,
-					gamma=2.0,
-					boundary_weight=3.0,
-					kernel_sizes=[3, 5]
-				)
-				self.combined_loss = CombinedLoss(
-					[dice_loss, focal_loss, boundary_loss],
-					[0.4, 0.3, 0.3]
-				)
-			else:
-				self.combined_loss = CombinedLoss(
-					[dice_loss, focal_loss],
-					[0.5, 0.5]
-				)
-	
-	def forward(self, pred, target):
-		"""
-		计算血管分割损失
- 
-		参数:
-		   pred: 预测值 [B, C, D, H, W]
-		   target: 目标值 [B, D, H, W]
- 
-		返回:
-		   损失值
-		"""
-		return self.combined_loss(pred, target)
-	
-	def get_loss_values(self):
-		"""获取各损失函数的值"""
-		return self.combined_loss.loss_values

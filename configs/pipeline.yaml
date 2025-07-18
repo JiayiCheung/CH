@@ -1,0 +1,42 @@
+# configs/pipeline.yaml
+
+data:
+  max_cases: 3
+  random_sampling: true
+
+
+
+
+
+
+model:
+  in_channels: 1
+  out_channels: 1
+  ch_params:
+    max_n: 3
+    max_k: 4
+    max_l: 5
+    cylindrical_dims: [32, 36, 32]
+  tier_params:
+    tier0_size: 256
+    tier1_size: 96
+    tier2_size: 64
+    max_tier1_patches: 10
+    max_tier2_patches: 30
+
+
+preprocessing:
+  clip_percentiles: [0.5, 99.5]
+  roi_threshold: 0.8
+  roi_percentile: 99.8
+  use_largest_cc: true
+
+
+smart_sampling:
+  tier1_samples: 10
+  tier2_samples: 30
+  vessel_density_threshold: 0.01
+  boundary_width: 5
+  enable_hard_mining: true
+  enable_vessel_priority: true
+  enable_boundary_priority: true

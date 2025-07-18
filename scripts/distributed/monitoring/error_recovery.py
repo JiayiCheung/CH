@@ -6,6 +6,7 @@
 
 import torch
 import psutil
+from typing import Tuple
 import time
 import logging
 import threading

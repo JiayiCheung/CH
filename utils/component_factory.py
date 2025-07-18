@@ -6,7 +6,7 @@ from pathlib import Path
 
 # 导入模型相关组件
 from models import VesselSegmenter
-from loss import VesselSegmentationLoss
+from loss import CombinedLoss
 from data.sampling_manager import SamplingManager
 from utils import Logger
 
@@ -55,11 +55,7 @@ class ComponentFactory:
 		
 		loss_config = config.get('loss', {})
 		
-		criterion = VesselSegmentationLoss(
-			num_classes=loss_config.get('num_classes', 1),
-			vessel_weight=loss_config.get('vessel_weight', 10.0),
-			tumor_weight=loss_config.get('tumor_weight', 15.0),
-			use_boundary=loss_config.get('use_boundary', True)
+		criterion = CombinedLoss(
 		)
 		
 		return criterion

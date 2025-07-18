@@ -20,7 +20,7 @@ source activate vessel
 # 设置分布式训练环境变量
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_PORT=29501
-export WORLD_SIZE=$((SLURM_NNODES * SLURM_NTASKS_PER_NODE))
+export WORLD_SIZE=$SLURM_NTASKS
 export PYTHONNOUSERSITE=1
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=8
@@ -28,7 +28,7 @@ export OMP_NUM_THREADS=8
 # 设置NCCL通信参数
 export NCCL_DEBUG=INFO
 export NCCL_IB_DISABLE=0
-export NCCL_SOCKET_IFNAME=ib0
+export NCCL_SOCKET_IFNAME=^docker0,lo
 
 # 打印作业信息
 echo "作业ID: $SLURM_JOB_ID"
@@ -39,7 +39,7 @@ echo "GPU总数: $((SLURM_NNODES * 4))"
 echo "进程总数: $WORLD_SIZE"
 
 # 创建输出目录
-OUTPUT_DIR="/home/bingxing2/home/scx7as9/run/CSUqx/CH/scripts/vessel_output/test_run"
+OUTPUT_DIR="/home/bingxing2/home/scx7as9/run/CSUqx/CH/scripts/distributed/vessel_output/test_run"
 mkdir -p ${OUTPUT_DIR}
 
 # 创建检查点目录
@@ -49,22 +49,20 @@ mkdir -p ${CHECKPOINT_DIR}
 
 
 # 使用srun启动分布式训练
-# 使用srun启动分布式训练，并设置RANK环境变量
 srun --export=ALL \
-     bash -c "export RANK=\$SLURM_PROCID; \
-     python distributed_train.py \
-     --image_dir /home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/imagesTr \
-     --label_dir /home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/labelsTr \
-     --output_dir $OUTPUT_DIR \
-     --config /home/bingxing2/home/scx7as9/run/CSUqx/CH/configs/distributed_train.yaml \
-     --epochs 10 \
-     --lr 1e-4 \
-     --num_workers 8 \
-     --val_interval 1 \
-     --local_rank \$SLURM_LOCALID \
-     --world_size $WORLD_SIZE \
-     --node_count \$SLURM_NNODES"
-
+  bash -c "
+    export RANK=\$SLURM_PROCID
+    export LOCAL_RANK=\$SLURM_LOCALID
+    python distributed_train.py \
+      --image_dir /home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/imagesTr \
+      --label_dir /home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/labelsTr \
+      --output_dir $OUTPUT_DIR \
+      --config /home/bingxing2/home/scx7as9/run/CSUqx/CH/configs/pipeline.yaml \
+      --epochs 10 \
+      --lr 1e-4 \
+      --num_workers 8 \
+      --val_interval 1
+  "
 
 
 
