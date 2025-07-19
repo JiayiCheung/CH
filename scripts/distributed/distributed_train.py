@@ -11,6 +11,8 @@ import argparse
 import yaml
 import logging
 import signal
+# 在现有导入中添加
+from tqdm import tqdm
 import traceback
 import copy
 from pathlib import Path
@@ -26,7 +28,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # 核心组件导入
-from data.dataset import LiverVesselDataset
+from data import LiverVesselDataset
 from models import create_vessel_segmenter
 from loss.combined_loss import CombinedLoss
 
@@ -450,14 +452,17 @@ class IntegratedPipelineTrainer:
 	def _setup_dataloader(self):
 		"""设置数据加载器"""
 		if self.rank == 0:
+			logger.info("📊 开始创建数据加载器...")
+			logger.info("🔍 正在创建训练数据集，这可能需要几分钟...")
+			
 			data_config = self.config.get('data', {})
 			train_dataset = LiverVesselDataset(
 				image_dir=self.args.image_dir,
 				label_dir=self.args.label_dir,
-				max_cases=data_config.get('max_cases', None),
+				max_cases=data_config.get('max_cases', 5),
 				random_sampling=data_config.get('random_sampling', True),
 				enable_smart_sampling=data_config.get('enable_smart_sampling', True),
-				config=self.config
+				
 			)
 			
 			self.train_loader = DataLoader(
@@ -476,7 +481,6 @@ class IntegratedPipelineTrainer:
 				max_cases=data_config.get('val_max_cases', 20),
 				random_sampling=False,
 				enable_smart_sampling=False,
-				config=self.config
 			)
 			
 			self.val_loader = DataLoader(
@@ -650,7 +654,7 @@ class IntegratedPipelineTrainer:
 			logger.info(f"Epoch {epoch} 开始训练")
 	
 	def _execute_enhanced_training_loop(self, epoch: int) -> Dict[str, float]:
-		"""执行增强版训练循环"""
+		"""执行增强版训练循环 - 带进度条"""
 		
 		# 设置为训练模式
 		self.stage.train()
@@ -659,88 +663,128 @@ class IntegratedPipelineTrainer:
 		batch_count = 0
 		epoch_start_time = time.time()
 		
-		# 只有rank 0有数据加载器
+		# ✅ 添加Batch级别进度条
 		if self.rank == 0 and self.train_loader:
-			data_iterator = enumerate(self.train_loader)
+			# Rank 0: 显示真实的数据加载进度
+			batch_pbar = tqdm(
+				enumerate(self.train_loader),
+				desc=f"📦 Epoch {epoch} Batches",
+				total=len(self.train_loader),
+				leave=False,
+				ncols=120,
+				colour='blue'
+			)
+			data_iterator = batch_pbar
 		else:
-			# 其他rank需要等待数据
-			data_iterator = [(i, None) for i in range(1000)]  # 估算的batch数量
+			# 其他rank: 估算batch数量
+			estimated_batches = len(self.train_loader) if hasattr(self, 'train_loader') and self.train_loader else 100
+			batch_pbar = tqdm(
+				enumerate([(i, None) for i in range(estimated_batches)]),
+				desc=f"🔧 Rank {self.rank} Epoch {epoch}",
+				total=estimated_batches,
+				leave=False,
+				ncols=100,
+				colour='yellow'
+			)
+			data_iterator = batch_pbar
 		
-		for batch_idx, batch in data_iterator:
-			batch_start_time = time.time()
-			
-			try:
-				# 批次开始前的检查和同步
-				if self.health_monitor:
-					if not self.health_monitor.check_system_health():
-						self._handle_health_issues()
+		try:
+			for batch_idx, batch in data_iterator:
+				batch_start_time = time.time()
 				
-				if self.param_sync:
-					self.param_sync.sync_on_batch_start()
-				
-				# 执行批次训练（流水线处理）
-				loss = self._process_batch_with_reliability(batch, batch_idx)
-				
-				if loss is not None:
-					# 梯度可靠性处理
-					if self.gradient_manager:
-						if not self.gradient_manager.compute_gradients_with_backoff(loss, epoch, batch_idx):
-							logger.warning(f"Batch {batch_idx} 梯度处理失败，跳过")
-							continue
-					else:
-						# 标准的反向传播和优化
-						if self.rank == 6:  # 只有最后一个rank计算loss
-							if self.scaler:
-								self.scaler.scale(loss).backward()
-								self.scaler.step(self.optimizer)
-								self.scaler.update()
-							else:
-								loss.backward()
-								torch.nn.utils.clip_grad_norm_(self.all_params, max_norm=1.0)
-								self.optimizer.step()
-							
-							self.optimizer.zero_grad()
-					
-					# 批次结束后的同步
-					if self.param_sync:
-						self.param_sync.sync_on_batch_end()
-					
-					# 记录批次指标到健康监控
+				try:
+					# 批次开始前的检查和同步
 					if self.health_monitor:
-						self.health_monitor.record_batch_metrics(
-							loss=loss.item() if loss is not None else 0.0,
-							model=self.stage,
-							optimizer=self.optimizer,
-							epoch=epoch,
-							batch_idx=batch_idx
-						)
+						if not self.health_monitor.check_system_health():
+							self._handle_health_issues()
 					
-					# 统计
-					if self.rank == 6:
-						total_loss += loss.item()
-						batch_count += 1
-				
-				# 定期日志记录
-				if batch_idx % self.args.log_interval == 0 and self.rank == 0:
+					if self.param_sync:
+						self.param_sync.sync_on_batch_start()
+					
+					# 执行批次训练（流水线处理）
+					loss = self._process_batch_with_reliability(batch, batch_idx)
+					
+					if loss is not None:
+						# 梯度可靠性处理
+						if self.gradient_manager:
+							if not self.gradient_manager.compute_gradients_with_backoff(loss, epoch, batch_idx):
+								logger.warning(f"Batch {batch_idx} 梯度处理失败，跳过")
+								continue
+						else:
+							# 标准的反向传播和优化
+							if self.rank == 6:  # 只有最后一个rank计算loss
+								if self.scaler:
+									self.scaler.scale(loss).backward()
+									self.scaler.step(self.optimizer)
+									self.scaler.update()
+								else:
+									loss.backward()
+									torch.nn.utils.clip_grad_norm_(self.all_params, max_norm=1.0)
+									self.optimizer.step()
+								
+								self.optimizer.zero_grad()
+						
+						# 批次结束后的同步
+						if self.param_sync:
+							self.param_sync.sync_on_batch_end()
+						
+						# 记录批次指标到健康监控
+						if self.health_monitor:
+							self.health_monitor.record_batch_metrics(
+								loss=loss.item() if loss is not None else 0.0,
+								model=self.stage,
+								optimizer=self.optimizer,
+								epoch=epoch,
+								batch_idx=batch_idx
+							)
+						
+						# 统计
+						if self.rank == 6:
+							total_loss += loss.item()
+							batch_count += 1
+					
+					# ✅ 更新Batch进度条
 					batch_time = time.time() - batch_start_time
-					logger.info(
-						f"Epoch {epoch}, Batch {batch_idx}, "
-						f"Loss: {loss.item() if loss else 'N/A':.6f}, "
-						f"Time: {batch_time:.3f}s"
-					)
+					
+					if self.rank == 0:
+						# Rank 0 显示详细信息
+						batch_pbar.set_postfix({
+							'Loss': f'{loss.item():.4f}' if loss else 'N/A',
+							'Avg': f'{total_loss / max(batch_count, 1):.4f}',
+							'Time': f'{batch_time:.2f}s',
+							'Mem': f'{torch.cuda.memory_allocated() / 1e9:.1f}GB'
+						})
+					else:
+						# 其他rank显示基本信息
+						batch_pbar.set_postfix({
+							'Stage': self.stage_config['stage'][:8],
+							'Time': f'{batch_time:.2f}s'
+						})
+					
+					# 保持原有的定期日志（减少频率避免刷屏）
+					if batch_idx % (self.args.log_interval * 5) == 0 and self.rank == 0:
+						batch_pbar.write(
+							f"📊 Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item() if loss else 'N/A':.6f}")
+					
+					self.training_state.batch = batch_idx
+					self.training_state.global_step += 1
+					
+					# 检查是否到达epoch结束（通过特殊信号）
+					if batch_idx > 0 and batch_idx % 100 == 0:
+						# 检查是否收到结束信号
+						if self._check_epoch_end_signal():
+							break
 				
-				self.training_state.batch = batch_idx
-				self.training_state.global_step += 1
-				
-				# 检查是否到达epoch结束（通过特殊信号）
-				if batch_idx > 0 and batch_idx % 100 == 0:
-					# 检查是否收到结束信号
-					if self._check_epoch_end_signal():
-						break
-			
-			except Exception as e:
-				self._handle_training_error(e, batch_idx)
-				continue
+				except Exception as e:
+					# ✅ 进度条中显示错误
+					batch_pbar.write(f"❌ Rank {self.rank} Batch {batch_idx} 错误: {e}")
+					self._handle_training_error(e, batch_idx)
+					continue
+		
+		finally:
+			# ✅ 确保关闭进度条
+			if hasattr(batch_pbar, 'close'):
+				batch_pbar.close()
 		
 		# 计算epoch指标
 		epoch_time = time.time() - epoch_start_time
@@ -756,6 +800,9 @@ class IntegratedPipelineTrainer:
 			'epoch_time': epoch_time,
 			'batch_count': batch_count
 		}
+	
+	
+	
 	
 	def _process_batch_with_reliability(self, batch, batch_idx: int):
 		"""带可靠性保障的批次处理"""
@@ -1250,10 +1297,21 @@ def main():
 		# 设置退出清理
 		cleanup_on_exit(trainer)
 		
-		# 训练循环
+		# ✅ 添加Epoch级别进度条
 		best_val_score = 0.0
 		
-		for epoch in range(args.epochs):
+		if rank == 0:
+			# 只有主进程显示总体进度条
+			epoch_pbar = tqdm(
+				range(args.epochs),
+				desc="🚀 Training Progress",
+				ncols=100,
+				colour='green'
+			)
+		else:
+			epoch_pbar = range(args.epochs)
+		
+		for epoch in epoch_pbar:
 			try:
 				# 训练一个epoch
 				epoch_start_time = time.time()
@@ -1280,30 +1338,48 @@ def main():
 						if rank == 0:
 							logger.info(f"新的最佳验证分数: {best_val_score:.4f}")
 				
-				# 主进程记录总体信息
+				# ✅ 更新Epoch进度条
 				if rank == 0:
-					logger.info(
-						f'Epoch {epoch}: '
-						f'Train Loss: {epoch_metrics.get("loss", 0.0):.6f}, '
-						f'Val Score: {val_score:.4f}, '
-						f'Time: {epoch_time:.2f}s'
-					)
+					epoch_pbar.set_postfix({
+						'Loss': f'{epoch_metrics.get("loss", 0.0):.4f}',
+						'Val': f'{val_score:.4f}',
+						'Best': f'{best_val_score:.4f}',
+						'Time': f'{epoch_time:.1f}s',
+						'GPU': f'{torch.cuda.memory_allocated() / 1e9:.1f}GB'
+					})
+					
+					# 同时保持原有的详细日志
+					if epoch % 5 == 0:  # 每5个epoch详细日志一次
+						logger.info(
+							f'Epoch {epoch}: '
+							f'Train Loss: {epoch_metrics.get("loss", 0.0):.6f}, '
+							f'Val Score: {val_score:.4f}, '
+							f'Time: {epoch_time:.2f}s'
+						)
 				
 				# 内存清理
 				if epoch % 10 == 0:
 					torch.cuda.empty_cache()
 			
 			except Exception as e:
+				if rank == 0:
+					epoch_pbar.write(f"❌ Epoch {epoch} 训练失败: {e}")
 				logger.error(f"Epoch {epoch} 训练失败: {e}")
 				traceback.print_exc()
 				
 				# 尝试恢复训练
 				if "CUDA out of memory" in str(e):
 					torch.cuda.empty_cache()
-					logger.info("GPU内存清理完成，尝试继续训练")
+					if rank == 0:
+						epoch_pbar.write("🧹 GPU内存清理完成，尝试继续训练")
 					continue
 				else:
 					raise e
+		
+		# ✅ 关闭进度条
+		if rank == 0:
+			epoch_pbar.close()
+			print("🎉 训练完成!")
 		
 		# 训练结束后的模型合并
 		trainer.finalize_training()

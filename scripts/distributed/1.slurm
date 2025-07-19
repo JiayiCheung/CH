@@ -3,66 +3,264 @@
 #SBATCH --job-name=TA-CHNet_training
 #SBATCH --output=TA-CHNet_training_%j.out
 #SBATCH --error=TA-CHNet_training_%j.err
-#SBATCH --nodes=2                # 请求2个计算节点
-#SBATCH --ntasks-per-node=4      # 每节点4个任务
-#SBATCH --gres=gpu:4             # 每节点4个GPU
+#SBATCH --nodes=2
+#SBATCH --ntasks=7               # 总共7个任务
+#SBATCH --ntasks-per-node=4      # 第一个节点4个，第二个节点3个
+#SBATCH --gres=gpu:4             # 每节点仍然申请4个GPU
 #SBATCH --cpus-per-task=8        # 每任务8个CPU核心
 #SBATCH --qos=gpugpu             # 多节点GPU作业必须添加此参数
 #SBATCH --time=48:00:00          # 最大运行时间48小时
 
-# 加载必要模块
+echo "=========================================="
+echo "🚀 TA-CHNet 肝脏血管分割模型分布式训练"
+echo "=========================================="
+echo "作业ID: $SLURM_JOB_ID"
+echo "开始时间: $(date)"
+
+# =============================================================================
+# 环境设置
+# =============================================================================
+echo "📦 加载环境模块..."
 module purge
 module load miniforge3/24.1 compilers/gcc/13.2.0 compilers/cuda/11.8 cudnn/8.8.1.3_cuda11.x
 
-# 激活conda环境
+echo "🐍 激活conda环境..."
 source activate vessel
 
-# 设置分布式训练环境变量
+echo "Python版本: $(python --version)"
+echo "PyTorch版本: $(python -c 'import torch; print(torch.__version__)')"
+echo "CUDA版本: $(python -c 'import torch; print(torch.version.cuda)')"
+
+# =============================================================================
+# 分布式环境变量设置 (基于测试结果优化)
+# =============================================================================
+echo "⚙️ 设置分布式环境变量..."
+
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_PORT=29501
 export WORLD_SIZE=$SLURM_NTASKS
 export PYTHONNOUSERSITE=1
+export WORLD_SIZE=7
+
+
+# CPU线程控制
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
 
-# 设置NCCL通信参数
+# =============================================================================
+# NCCL网络配置 (使用测试验证的成功配置)
+# =============================================================================
+echo "🌐 配置NCCL网络通信..."
+
+# ✅ 基于测试成功的配置1
 export NCCL_DEBUG=INFO
-export NCCL_IB_DISABLE=0
-export NCCL_SOCKET_IFNAME=^docker0,lo
+export NCCL_IB_DISABLE=1                    # 禁用InfiniBand，使用以太网
+export NCCL_SOCKET_IFNAME="^lo,docker0"     # 排除回环和docker接口
+export NCCL_TIMEOUT=1800                    # 30分钟超时
 
-# 打印作业信息
-echo "作业ID: $SLURM_JOB_ID"
-echo "开始时间: $(date)"
+# 性能优化设置
+export NCCL_TREE_THRESHOLD=0               # 强制使用树形算法
+export NCCL_NET_GDR_LEVEL=0                # 禁用GPU直接RDMA
+export NCCL_P2P_LEVEL=NVL                  # 使用NVLink进行节点内通信
+
+# 内存优化
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+export CUDA_LAUNCH_BLOCKING=0
+
+echo "网络配置信息:"
+echo "  MASTER_ADDR: $MASTER_ADDR"
+echo "  MASTER_PORT: $MASTER_PORT"
+echo "  WORLD_SIZE: $WORLD_SIZE"
+echo "  NCCL_IB_DISABLE: $NCCL_IB_DISABLE"
+echo "  NCCL_SOCKET_IFNAME: $NCCL_SOCKET_IFNAME"
+
+# =============================================================================
+# 路径和目录设置
+# =============================================================================
+echo "📁 设置项目路径..."
+
+PROJECT_ROOT="/home/bingxing2/home/scx7as9/run/CSUqx/CH"
+DATA_ROOT="/home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel"
+OUTPUT_DIR="/home/bingxing2/home/scx7as9/run/CSUqx/CH/scripts/distributed/vessel_output/run_${SLURM_JOB_ID}"
+CHECKPOINT_DIR="${OUTPUT_DIR}/checkpoints"
+LOG_DIR="${OUTPUT_DIR}/logs"
+
+# 创建必要目录
+mkdir -p ${OUTPUT_DIR}
+mkdir -p ${CHECKPOINT_DIR}
+mkdir -p ${LOG_DIR}
+
+echo "目录设置:"
+echo "  项目根目录: $PROJECT_ROOT"
+echo "  数据目录: $DATA_ROOT"
+echo "  输出目录: $OUTPUT_DIR"
+echo "  检查点目录: $CHECKPOINT_DIR"
+
+cd $PROJECT_ROOT
+
+# =============================================================================
+# 硬件信息收集
+# =============================================================================
+echo "💻 硬件信息:"
 echo "节点列表: $(scontrol show hostnames $SLURM_JOB_NODELIST)"
 echo "主节点: $MASTER_ADDR"
+echo "节点数: $SLURM_NNODES"
+echo "每节点GPU数: 4"
 echo "GPU总数: $((SLURM_NNODES * 4))"
 echo "进程总数: $WORLD_SIZE"
 
-# 创建输出目录
-OUTPUT_DIR="/home/bingxing2/home/scx7as9/run/CSUqx/CH/scripts/distributed/vessel_output/test_run"
-mkdir -p ${OUTPUT_DIR}
+# 检查GPU状态
+echo "🔍 GPU状态检查..."
+srun --export=ALL --ntasks=2 --ntasks-per-node=1 \
+    bash -c "echo \"=== 节点: \$(hostname) ===\"; nvidia-smi --query-gpu=index,name,memory.total,memory.free --format=csv,noheader"
 
-# 创建检查点目录
-CHECKPOINT_DIR="${OUTPUT_DIR}/checkpoints"
-mkdir -p ${CHECKPOINT_DIR}
+# =============================================================================
+# 训练配置检查
+# =============================================================================
+echo "📋 训练配置检查..."
+
+CONFIG_FILE="/home/bingxing2/home/scx7as9/run/CSUqx/CH/configs/pipeline.yaml"
+TRAIN_SCRIPT="$PROJECT_ROOT/scripts/distributed/distributed_train.py"
+
+# 检查关键文件是否存在
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "❌ 配置文件不存在: $CONFIG_FILE"
+    exit 1
+fi
+
+if [ ! -f "$TRAIN_SCRIPT" ]; then
+    echo "❌ 训练脚本不存在: $TRAIN_SCRIPT"
+    exit 1
+fi
+
+if [ ! -d "$DATA_ROOT/imagesTr" ]; then
+    echo "❌ 训练图像目录不存在: $DATA_ROOT/imagesTr"
+    exit 1
+fi
+
+if [ ! -d "$DATA_ROOT/labelsTr" ]; then
+    echo "❌ 训练标签目录不存在: $DATA_ROOT/labelsTr"
+    exit 1
+fi
+
+echo "✅ 所有必要文件检查通过"
+
+# =============================================================================
+# 启动前的网络连通性测试
+# =============================================================================
+echo "🔗 快速网络连通性测试..."
+srun --export=ALL --ntasks=2 --ntasks-per-node=1 \
+    bash -c "
+        export RANK=\$SLURM_PROCID
+        export LOCAL_RANK=\$SLURM_LOCALID
+        echo \"[测试] 节点: \$(hostname), Rank: \$RANK\"
+        timeout 60 python -c \"
+import torch
+import torch.distributed as dist
+import os
+torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
+dist.init_process_group('nccl', init_method='env://')
+print(f'✅ Rank {dist.get_rank()}: NCCL初始化成功')
+dist.destroy_process_group()
+        \"
+    " 2>/dev/null
+
+if [ $? -eq 0 ]; then
+    echo "✅ 网络连通性测试通过"
+else
+    echo "⚠️ 网络连通性测试失败，但继续训练..."
+fi
+
+# =============================================================================
+# 启动分布式训练
+# =============================================================================
+echo "=========================================="
+echo "🎯 启动TA-CHNet分布式训练"
+echo "=========================================="
 
 
-
-# 使用srun启动分布式训练
+# 启动训练
 srun --export=ALL \
   bash -c "
     export RANK=\$SLURM_PROCID
     export LOCAL_RANK=\$SLURM_LOCALID
-    python distributed_train.py \
-      --image_dir /home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/imagesTr \
-      --label_dir /home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/labelsTr \
-      --output_dir $OUTPUT_DIR \
-      --config /home/bingxing2/home/scx7as9/run/CSUqx/CH/configs/pipeline.yaml \
-      --epochs 10 \
+    echo \"[启动] 节点: \$(hostname), Global Rank: \$RANK, Local Rank: \$LOCAL_RANK\"
+
+    # 切换到项目目录
+    cd $PROJECT_ROOT
+
+    # 启动训练
+    python scripts/distributed/distributed_train.py \
+      --image_dir ${DATA_ROOT}/imagesTr \
+      --label_dir ${DATA_ROOT}/labelsTr \
+      --output_dir ${OUTPUT_DIR} \
+      --config ${CONFIG_FILE} \
+      --epochs 20 \
       --lr 1e-4 \
       --num_workers 8 \
-      --val_interval 1
+      --val_interval 3 \
+      --save_interval 5 \
+      --log_interval 50 \
+      --amp \
+      2>&1 | tee ${LOG_DIR}/rank_\${RANK}.log
   "
 
+TRAIN_EXIT_CODE=$?
 
+# =============================================================================
+# 训练完成后处理
+# =============================================================================
+echo "=========================================="
+echo "📊 训练完成后处理"
+echo "=========================================="
 
+echo "结束时间: $(date)"
+echo "训练退出码: $TRAIN_EXIT_CODE"
+
+# 收集训练统计信息
+if [ -d "${LOG_DIR}" ]; then
+    echo "📈 收集训练日志..."
+
+    # 合并所有rank的日志
+    cat ${LOG_DIR}/rank_*.log > ${LOG_DIR}/combined_training.log 2>/dev/null || true
+
+    # 统计训练时间
+    TRAIN_TIME=$(grep -h "训练耗时" ${LOG_DIR}/rank_*.log | head -1 2>/dev/null || echo "未知")
+    echo "总训练时间: $TRAIN_TIME"
+
+    # 检查最终模型
+    if [ -f "${CHECKPOINT_DIR}/final_model.pth" ]; then
+        echo "✅ 最终模型已保存: ${CHECKPOINT_DIR}/final_model.pth"
+        ls -lh ${CHECKPOINT_DIR}/final_model.pth
+    else
+        echo "⚠️ 未找到最终模型文件"
+    fi
+
+    # 检查最佳模型
+    if [ -f "${CHECKPOINT_DIR}/best_model.pth" ]; then
+        echo "✅ 最佳模型已保存: ${CHECKPOINT_DIR}/best_model.pth"
+        ls -lh ${CHECKPOINT_DIR}/best_model.pth
+    fi
+fi
+
+# GPU状态最终检查
+echo "🔧 最终GPU状态:"
+srun --export=ALL --ntasks=1 --ntasks-per-node=1 \
+    nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null || true
+
+if [ $TRAIN_EXIT_CODE -eq 0 ]; then
+    echo "🎉 TA-CHNet训练成功完成！"
+    echo "📁 结果保存在: ${OUTPUT_DIR}"
+    echo "📋 日志文件: ${LOG_DIR}/combined_training.log"
+    echo "💾 模型文件: ${CHECKPOINT_DIR}/"
+else
+    echo "❌ 训练过程中出现错误 (退出码: $TRAIN_EXIT_CODE)"
+    echo "🔍 请查看错误日志: ${LOG_DIR}/"
+fi
+
+echo "=========================================="
+echo "作业完成时间: $(date)"
+echo "=========================================="
+
+exit $TRAIN_EXIT_CODE
