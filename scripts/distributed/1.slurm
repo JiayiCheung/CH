@@ -4,8 +4,7 @@
 #SBATCH --output=TA-CHNet_training_%j.out
 #SBATCH --error=TA-CHNet_training_%j.err
 #SBATCH --nodes=2
-#SBATCH --ntasks=7               # 总共7个任务
-#SBATCH --ntasks-per-node=4      # 第一个节点4个，第二个节点3个
+#SBATCH --ntasks-per-node=4
 #SBATCH --gres=gpu:4             # 每节点仍然申请4个GPU
 #SBATCH --cpus-per-task=8        # 每任务8个CPU核心
 #SBATCH --qos=gpugpu             # 多节点GPU作业必须添加此参数
@@ -40,7 +39,7 @@ export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_PORT=29501
 export WORLD_SIZE=$SLURM_NTASKS
 export PYTHONNOUSERSITE=1
-export WORLD_SIZE=7
+export WORLD_SIZE=8
 
 
 # CPU线程控制
@@ -51,29 +50,36 @@ export MKL_NUM_THREADS=8
 # =============================================================================
 # NCCL网络配置 (使用测试验证的成功配置)
 # =============================================================================
-echo "🌐 配置NCCL网络通信..."
+echo "🌐 配置NCCL网络通信（使用100G RoCE高速网络）..."
 
-# ✅ 基于测试成功的配置1
-export NCCL_DEBUG=INFO
-export NCCL_IB_DISABLE=1                    # 禁用InfiniBand，使用以太网
-export NCCL_SOCKET_IFNAME="^lo,docker0"     # 排除回环和docker接口
-export NCCL_TIMEOUT=1800                    # 30分钟超时
+# ✅ 按N32-H分区手册要求配置
+export NCCL_DEBUG=WARN
+export NCCL_IB_DISABLE=0                    # 启用InfiniBand接口访问RoCE
+export NCCL_IB_HCA=mlx5_0,mlx5_2           # 手册指定的Mellanox网卡
+export NCCL_IB_GID_INDEX=3                 # 手册指定的GID索引
+export NCCL_TIMEOUT=1800                   # 30分钟超时
 
-# 性能优化设置
+# RoCE RDMA优化设置
+export NCCL_NET_GDR_LEVEL=2                # 启用GPU Direct RDMA
+export NCCL_IB_TIMEOUT=23                  # IB接口超时设置
 export NCCL_TREE_THRESHOLD=0               # 强制使用树形算法
-export NCCL_NET_GDR_LEVEL=0                # 禁用GPU直接RDMA
-export NCCL_P2P_LEVEL=NVL                  # 使用NVLink进行节点内通信
+export NCCL_P2P_LEVEL=NVL                  # 节点内NVLink通信
+
 
 # 内存优化
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 export CUDA_LAUNCH_BLOCKING=0
+
+
 
 echo "网络配置信息:"
 echo "  MASTER_ADDR: $MASTER_ADDR"
 echo "  MASTER_PORT: $MASTER_PORT"
 echo "  WORLD_SIZE: $WORLD_SIZE"
 echo "  NCCL_IB_DISABLE: $NCCL_IB_DISABLE"
-echo "  NCCL_SOCKET_IFNAME: $NCCL_SOCKET_IFNAME"
+echo "  NCCL_IB_HCA: $NCCL_IB_HCA"
+echo "  NCCL_IB_GID_INDEX: $NCCL_IB_GID_INDEX"
+echo "  NCCL_NET: $NCCL_NET"
 
 # =============================================================================
 # 路径和目录设置
@@ -146,31 +152,7 @@ fi
 
 echo "✅ 所有必要文件检查通过"
 
-# =============================================================================
-# 启动前的网络连通性测试
-# =============================================================================
-echo "🔗 快速网络连通性测试..."
-srun --export=ALL --ntasks=2 --ntasks-per-node=1 \
-    bash -c "
-        export RANK=\$SLURM_PROCID
-        export LOCAL_RANK=\$SLURM_LOCALID
-        echo \"[测试] 节点: \$(hostname), Rank: \$RANK\"
-        timeout 60 python -c \"
-import torch
-import torch.distributed as dist
-import os
-torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
-dist.init_process_group('nccl', init_method='env://')
-print(f'✅ Rank {dist.get_rank()}: NCCL初始化成功')
-dist.destroy_process_group()
-        \"
-    " 2>/dev/null
 
-if [ $? -eq 0 ]; then
-    echo "✅ 网络连通性测试通过"
-else
-    echo "⚠️ 网络连通性测试失败，但继续训练..."
-fi
 
 # =============================================================================
 # 启动分布式训练

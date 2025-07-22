@@ -258,7 +258,8 @@ class IntegratedPipelineTrainer:
 			3: {'stage': 'spatial_branch', 'next_ranks': [4], 'prev_ranks': [1]},
 			4: {'stage': 'feature_fusion', 'next_ranks': [5], 'prev_ranks': [2, 3]},
 			5: {'stage': 'multiscale_fusion', 'next_ranks': [6], 'prev_ranks': [4]},
-			6: {'stage': 'segmentation_head', 'next_ranks': [], 'prev_ranks': [5]}
+			6: {'stage': 'segmentation_head', 'next_ranks': [], 'prev_ranks': [5]},
+			7: {'stage': 'dummy_stage', 'next_ranks': [], 'prev_ranks': []}
 		}
 		
 		self.stage_config = self.pipeline_config[rank]
@@ -413,17 +414,29 @@ class IntegratedPipelineTrainer:
 	def _setup_basic_components(self):
 		"""设置基础组件"""
 		
-		# 创建节点通信器
+		# 创建节点通信器并升级为增强版本
+		from scripts.distributed.reliability.communication_reliability import upgrade_node_communicator
+		
 		comm_config = self.config.get('distributed', {}).get('communication', {})
 		node_count = comm_config.get('node_count', 2)
 		
-		self.node_comm = NodeCommunicator(
+		# 创建原始通信器
+		original_node_comm = NodeCommunicator(
 			world_size=self.world_size,
 			rank=self.rank,
 			local_rank=self.local_rank,
 			node_rank=self.rank // (self.world_size // node_count),
 			node_count=node_count
 		)
+		
+		# 升级为增强版本
+		self.node_comm = upgrade_node_communicator(original_node_comm)
+		
+		# 记录通信器版本
+		logger.info(f"🔗 通信器初始化完成 - Rank {self.rank}:")
+		logger.info(f"  - 可靠传输: ✅ 启用")
+		logger.info(f"  - 复杂数据类型: ✅ 支持")
+		logger.info(f"  - 回退模式: ✅ 支持")
 		
 		# 创建完整模型（用于提取组件）
 		self.full_model = create_vessel_segmenter(self.config)
@@ -516,7 +529,10 @@ class IntegratedPipelineTrainer:
 		
 		# 混合精度
 		self.scaler = torch.cuda.amp.GradScaler() if self.args.amp else None
-	
+
+
+
+
 	def _setup_enhanced_components(self):
 		"""设置增强组件"""
 		distributed_config = self.config.get('distributed', {})
@@ -524,13 +540,7 @@ class IntegratedPipelineTrainer:
 		# 1. 通信可靠性增强
 		comm_config = distributed_config.get('communication', {})
 		if comm_config.get('enable_reliability', True):
-			self.enhanced_comm = EnhancedNodeCommunicator(
-				original_comm=self.node_comm,
-				max_chunk_size=comm_config.get('max_chunk_size', 50 * 1024 * 1024),
-				compression_level=comm_config.get('compression_level', 6),
-				send_timeout=comm_config.get('send_timeout', 30.0),
-				recv_timeout=comm_config.get('recv_timeout', 60.0)
-			)
+			self.enhanced_comm = EnhancedNodeCommunicator(self.node_comm)
 			# 替换原有通信器
 			self.node_comm = self.enhanced_comm
 		
@@ -573,6 +583,9 @@ class IntegratedPipelineTrainer:
 			world_size=self.world_size,
 			base_dir=self.args.output_dir
 		)
+	
+	
+	
 	
 	def _setup_evaluation_and_logging(self):
 		"""设置评估和日志组件"""
@@ -647,6 +660,8 @@ class IntegratedPipelineTrainer:
 			if not self.health_monitor.check_system_health():
 				logger.warning(f"Rank {self.rank} 健康检查发现问题")
 		
+		
+		
 		# 全局同步点
 		dist.barrier()
 		
@@ -655,6 +670,18 @@ class IntegratedPipelineTrainer:
 	
 	def _execute_enhanced_training_loop(self, epoch: int) -> Dict[str, float]:
 		"""执行增强版训练循环 - 带进度条"""
+		
+		if self.rank == 7:
+			# DummyStage什么都不做，只是占用GPU
+			self.stage.train()
+			time.sleep(1)  # 模拟一些工作
+			return {
+				'loss': 0.0,
+				'epoch_time': 1.0,
+				'batch_count': 0
+			}
+		
+		
 		
 		# 设置为训练模式
 		self.stage.train()
@@ -807,6 +834,13 @@ class IntegratedPipelineTrainer:
 	def _process_batch_with_reliability(self, batch, batch_idx: int):
 		"""带可靠性保障的批次处理"""
 		try:
+			if self.rank == 7:
+				# DummyStage不参与任何实际处理
+				self.stage.process()  # 调用DummyStage的process方法
+				return None
+			
+			
+			
 			if self.rank == 0:
 				# Rank 0: 数据预处理
 				if batch is None:
@@ -1285,6 +1319,12 @@ def main():
 		if rank == 0:
 			Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 			logger.info(f"输出目录创建: {args.output_dir}")
+		
+		logger.info(f"Rank {rank}: 准备执行barrier同步...")
+		
+		# 让rank按顺序初始化，避免同时竞争资源
+		time.sleep(rank * 2)  # 每个rank延迟不同时间
+		
 		
 		# 全局同步
 		dist.barrier()

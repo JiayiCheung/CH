@@ -2,9 +2,12 @@
 
 data:
   max_cases: 3
+  val_max_cases: 2
   random_sampling: true
 
 
+loss:
+  type: "CombinedLoss"
 
 
 
@@ -34,9 +37,9 @@ preprocessing:
 
 smart_sampling:
   tier1_samples: 10
-  tier2_samples: 30
+  tier2_samples: 10
   vessel_density_threshold: 0.01
   boundary_width: 5
-  enable_hard_mining: true
+  enable_hard_mining: false
   enable_vessel_priority: true
-  enable_boundary_priority: true
+  enable_boundary_priority: false

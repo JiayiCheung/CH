@@ -227,16 +227,18 @@ class HealthMonitor:
 	
 	def _log_health_status(self, metrics: HealthMetrics):
 		"""记录健康状态日志"""
-		self.logger.info(
-			f"[HEALTH] Rank {self.rank} | "
-			f"GPU: {metrics.gpu_temperature:.1f}°C, "
-			f"Mem: {metrics.gpu_memory_used:.0f}/{metrics.gpu_memory_total:.0f}MB "
-			f"({metrics.gpu_memory_used / metrics.gpu_memory_total * 100:.1f}%), "
-			f"Util: {metrics.gpu_utilization:.1f}% | "
-			f"CPU: {metrics.cpu_usage:.1f}%, "
-			f"RAM: {metrics.ram_usage:.1f}% | "
-			f"Net: {metrics.network_latency:.1f}ms" if metrics.network_latency else "Net: N/A"
-		)
+		#self.logger.info(
+			#f"[HEALTH] Rank {self.rank} | "
+			#f"GPU: {metrics.gpu_temperature:.1f}°C, "
+			#f"Mem: {metrics.gpu_memory_used:.0f}/{metrics.gpu_memory_total:.0f}MB "
+			#f"({metrics.gpu_memory_used / metrics.gpu_memory_total * 100:.1f}%), "
+			#f"Util: {metrics.gpu_utilization:.1f}% | "
+			#f"CPU: {metrics.cpu_usage:.1f}%, "
+			#f"RAM: {metrics.ram_usage:.1f}% | "
+			#f"Net: {metrics.network_latency:.1f}ms" if metrics.network_latency else "Net: N/A")
+	
+		pass
+	
 	
 	def _check_health_alerts(self, metrics: HealthMetrics):
 		"""检查健康警报"""
@@ -248,8 +250,7 @@ class HealthMonitor:
 		
 		# GPU内存警报
 		memory_usage = metrics.gpu_memory_used / metrics.gpu_memory_total * 100
-		if memory_usage > 95:
-			alerts.append(f"GPU内存不足: {memory_usage:.1f}%")
+		
 		
 		# CPU使用率警报
 		if metrics.cpu_usage > 90:

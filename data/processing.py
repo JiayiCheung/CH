@@ -24,7 +24,7 @@ class CTPreprocessor:
 		self.roi_threshold = roi_threshold
 		self.roi_percentile = roi_percentile
 		self.use_largest_cc = use_largest_cc
-		self.device = device if torch.cuda.is_available() and 'cuda' in device else 'cpu'
+		self.device = 'cuda'
 		self.logger = logger
 		
 		# 缓存上次计算的结果，避免重复计算

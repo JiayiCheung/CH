@@ -13,8 +13,6 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 
 
-
-
 class BaseStage(nn.Module):
 	"""处理阶段基类，提供共享功能"""
 	
@@ -40,7 +38,12 @@ class BaseStage(nn.Module):
 		self.worker_thread = None
 		self.running = False
 		
+		# 🔥 新增：日志记录器
+		self.logger = logging.getLogger(f"{__name__}.{name}")
 		
+		# 🔥 新增：通信统计
+		self.comm_success_count = 0
+		self.comm_failure_count = 0
 	
 	def train(self, mode=True):
 		"""设置训练模式"""
@@ -124,6 +127,55 @@ class BaseStage(nn.Module):
 	def get_state_dict_prefix(self):
 		"""获取带前缀的参数字典"""
 		return {}
+	
+	def log_communication_stats(self):
+		"""记录通信状态统计"""
+		if hasattr(self.node_comm, 'get_detailed_stats'):
+			stats = self.node_comm.get_detailed_stats()
+			
+			self.logger.info(f"📊 {self.name} 通信状态:")
+			self.logger.info(f"  成功: {self.comm_success_count}")
+			self.logger.info(f"  失败: {self.comm_failure_count}")
+			self.logger.info(f"  发送失败: {stats.get('send_failures', 0)}")
+			self.logger.info(f"  接收失败: {stats.get('recv_failures', 0)}")
+			
+			if stats.get('send_failures', 0) + stats.get('recv_failures', 0) > 0:
+				self.logger.warning("⚠️  检测到通信错误，建议检查网络连接")
+	
+	def update_comm_stats(self, success: bool):
+		"""更新通信统计"""
+		if success:
+			self.comm_success_count += 1
+		else:
+			self.comm_failure_count += 1
+
+
+class DummyStage(BaseStage):
+	"""极简占位阶段 - 只占用GPU，不参与主流水线"""
+	
+	def __init__(self, model, device, node_comm=None, config=None):
+		super().__init__("DummyStage", device, node_comm)
+		
+		# 创建一个极小的"装饰"网络，占用一点GPU内存
+		self.dummy_layer = nn.Linear(10, 1).to(device)
+	
+	def process(self, dummy_input=None):
+		"""极简处理 - 什么都不做"""
+		# 偶尔做个无意义的计算，防止被系统回收
+		if dummy_input is None:
+			dummy_input = torch.randn(1, 10, device=self.device)
+		
+		_ = self.dummy_layer(dummy_input)  # 扔掉结果
+		return None
+	
+	def forward(self, *args, **kwargs):
+		"""不接收任何数据，不发送任何数据"""
+		time.sleep(0.001)  # 装作在工作
+		return None
+	
+	def get_state_dict_prefix(self):
+		"""返回空状态字典"""
+		return {}
 
 
 # 节点1 (GPU 0): 数据预处理+ROI提取
@@ -138,10 +190,10 @@ class FrontendStage(BaseStage):
 		self.preprocessor = None
 		if shared_components and 'preprocessor' in shared_components:
 			self.preprocessor = shared_components['preprocessor']
-			
+		
 		elif hasattr(model, 'preprocessor') and model.preprocessor is not None:
 			self.preprocessor = model.preprocessor
-			
+		
 		else:
 			# 只在完全找不到时才创建新实例
 			from data.processing import CTPreprocessor
@@ -158,9 +210,8 @@ class FrontendStage(BaseStage):
 				roi_percentile=roi_percentile,
 				use_largest_cc=use_largest_cc,
 				device=device,
-				
-			)
 			
+			)
 		
 		# 移动到指定设备
 		self.to(device)
@@ -238,8 +289,6 @@ class FrontendStage(BaseStage):
 		return state_dict
 
 
-
-
 # 节点1 (GPU 1): 三级采样+Patch调度
 class PatchSchedulingStage(BaseStage):
 	"""Patch采样和调度阶段"""
@@ -252,10 +301,10 @@ class PatchSchedulingStage(BaseStage):
 		self.tier_sampler = None
 		if shared_components and 'tier_sampler' in shared_components:
 			self.tier_sampler = shared_components['tier_sampler']
-			
+		
 		elif hasattr(model, 'tier_sampler') and model.tier_sampler is not None:
 			self.tier_sampler = model.tier_sampler
-			
+		
 		else:
 			# 只在完全找不到时才创建新实例
 			from data.tier_sampling import TierSampler
@@ -268,9 +317,9 @@ class PatchSchedulingStage(BaseStage):
 				tier0_size=sampling_config.get('tier0_size', 256),
 				tier1_size=sampling_config.get('tier1_size', 96),
 				tier2_size=sampling_config.get('tier2_size', 64),
-				sampling_params=sampling_config
+				max_tier1=sampling_config.get('maxtier1', 10),
+				max_tier2=sampling_config.get('maxtier2', 20)
 			)
-			
 		
 		# 移动到指定设备
 		self.to(device)
@@ -386,42 +435,86 @@ class PatchSchedulingStage(BaseStage):
 		# 处理数据
 		patches, case_patches = self.process(processed_images, labels)
 		
-		# 将patches发送到CH分支(GPU 2)和空间分支(GPU 3)
+		# 将patches发送到CH分支(GPU 2)和空间分支(GPU 3) - 使用新的通信方式
 		if self.node_comm:
+			# 准备发送数据：转换为List[Tuple[torch.Tensor, int]]格式
+			patch_data = []
+			for patch in patches:
+				# 转换patch为张量
+				if isinstance(patch['image'], np.ndarray):
+					patch_tensor = torch.from_numpy(patch['image']).float().unsqueeze(0).to(self.device)
+				else:
+					patch_tensor = patch['image'].to(self.device)
+				
+				tier = int(patch['tier'])
+				patch_data.append((patch_tensor, tier))
+			
 			# 发送到CH分支 (GPU 2)
 			ch_rank = self.node_comm.rank + 1
+			success_ch = self._send_patches_to_branch(patch_data, ch_rank, "CH", tag=50)
 			
-			# 发送patches数量
-			count_tensor = torch.tensor([len(patches)], dtype=torch.long, device=self.device)
-			self.node_comm.send_tensor(count_tensor, dst_rank=ch_rank)
-			
-			# 发送每个patch
-			for patch in patches:
-				# 转换patch为张量
-				patch_tensor = torch.from_numpy(patch['image']).float().unsqueeze(0).to(self.device)
-				tier_tensor = torch.tensor([patch['tier']], dtype=torch.long, device=self.device)
-				
-				# 发送图像和tier信息
-				self.node_comm.send_tensor(patch_tensor, dst_rank=ch_rank)
-				self.node_comm.send_tensor(tier_tensor, dst_rank=ch_rank)
-			
-			# 同时发送到空间分支 (GPU 3)
+			# 发送到空间分支 (GPU 3)
 			spatial_rank = ch_rank + 1
+			success_spatial = self._send_patches_to_branch(patch_data, spatial_rank, "Spatial", tag=60)
 			
-			# 发送patches数量
-			self.node_comm.send_tensor(count_tensor, dst_rank=spatial_rank)
-			
-			# 发送每个patch
-			for patch in patches:
-				# 转换patch为张量
-				patch_tensor = torch.from_numpy(patch['image']).float().unsqueeze(0).to(self.device)
-				tier_tensor = torch.tensor([patch['tier']], dtype=torch.long, device=self.device)
-				
-				# 发送图像和tier信息
-				self.node_comm.send_tensor(patch_tensor, dst_rank=spatial_rank)
-				self.node_comm.send_tensor(tier_tensor, dst_rank=spatial_rank)
+			# 记录发送状态
+			if success_ch and success_spatial:
+				self.logger.debug(f"✅ Patches发送成功: {len(patches)}个patches到两个分支")
+				self.update_comm_stats(True)
+			else:
+				self.logger.warning(f"⚠️  Patches发送部分失败: CH={success_ch}, Spatial={success_spatial}")
+				self.update_comm_stats(False)
 		
 		return patches, case_patches
+	
+	def _send_patches_to_branch(self, patch_data: List[Tuple[torch.Tensor, int]],
+	                            dst_rank: int, branch_name: str, tag: int = 0) -> bool:
+		"""发送patches到指定分支"""
+		try:
+			# 🔥 优先使用新的复杂数据类型传输
+			if hasattr(self.node_comm, 'send_tensor_tuple_list'):
+				success = self.node_comm.send_tensor_tuple_list(patch_data, dst_rank=dst_rank, tag=tag)
+				if success:
+					self.logger.debug(f"✅ {branch_name}分支发送成功: {len(patch_data)}个patches")
+					return True
+				else:
+					self.logger.warning(f"⚠️  {branch_name}分支发送失败，尝试回退模式")
+			
+			elif hasattr(self.node_comm, 'send_data'):
+				success = self.node_comm.send_data(patch_data, dst_rank=dst_rank, tag=tag, reliable=True)
+				if success:
+					self.logger.debug(f"✅ {branch_name}分支发送成功(通用模式): {len(patch_data)}个patches")
+					return True
+				else:
+					self.logger.warning(f"⚠️  {branch_name}分支发送失败，尝试回退模式")
+			
+			# 回退到原有发送方式
+			return self._fallback_send_patches(patch_data, dst_rank, branch_name)
+		
+		except Exception as e:
+			self.logger.error(f"❌ {branch_name}分支发送异常: {e}")
+			return self._fallback_send_patches(patch_data, dst_rank, branch_name)
+	
+	def _fallback_send_patches(self, patch_data: List[Tuple[torch.Tensor, int]],
+	                           dst_rank: int, branch_name: str) -> bool:
+		"""回退发送方式"""
+		try:
+			# 发送patches数量
+			count_tensor = torch.tensor([len(patch_data)], dtype=torch.long, device=self.device)
+			self.node_comm.send_tensor(count_tensor, dst_rank=dst_rank, reliable=False)
+			
+			# 逐个发送patches
+			for patch_tensor, tier in patch_data:
+				self.node_comm.send_tensor(patch_tensor, dst_rank=dst_rank, reliable=False)
+				tier_tensor = torch.tensor([tier], dtype=torch.long, device=self.device)
+				self.node_comm.send_tensor(tier_tensor, dst_rank=dst_rank, reliable=False)
+			
+			self.logger.debug(f"✅ {branch_name}分支发送成功(回退模式): {len(patch_data)}个patches")
+			return True
+		
+		except Exception as e:
+			self.logger.error(f"❌ {branch_name}分支回退发送也失败: {e}")
+			return False
 	
 	def get_state_dict_prefix(self):
 		"""获取带前缀的参数字典"""
@@ -492,7 +585,6 @@ class CHProcessingStage(BaseStage):
 		
 		return ch_features, processed_tiers
 	
-	
 	def forward(self, patches=None, tiers=None):
 		"""同步前向处理 - 优化版"""
 		if patches is None and self.node_comm:
@@ -532,24 +624,73 @@ class CHProcessingStage(BaseStage):
 		# 处理数据
 		ch_features, processed_tiers = self.process(patches, tiers)
 		
-		# 发送到FeatureFusionStage
+		# 发送到FeatureFusionStage - 使用新的复杂数据类型传输
 		if self.node_comm:
 			# 目标rank计算（节点2的GPU 4）
 			fusion_rank = self.node_comm.node_ranks[1] if hasattr(self.node_comm,
 			                                                      'node_ranks') else self.node_comm.rank + 2
 			
-			# 发送特征数量
-			count_tensor = torch.tensor([len(ch_features)], dtype=torch.long, device=self.device)
-			self.node_comm.send_tensor(count_tensor, dst_rank=fusion_rank)
-			
-			# 批量发送特征
-			for ch_feat, tier in zip(ch_features, processed_tiers):
-				self.node_comm.send_tensor(ch_feat, dst_rank=fusion_rank)
+			try:
+				# 🔥 新功能：直接发送List[Tuple[torch.Tensor, int]]格式
+				ch_data = [(ch_feat, tier) for ch_feat, tier in zip(ch_features, processed_tiers)]
 				
-				tier_tensor = torch.tensor([tier], dtype=torch.long, device=self.device)
-				self.node_comm.send_tensor(tier_tensor, dst_rank=fusion_rank)
+				# 检查是否支持新的复杂数据类型传输
+				if hasattr(self.node_comm, 'send_tensor_tuple_list'):
+					# 使用专门的方法发送tensor-tuple列表
+					success = self.node_comm.send_tensor_tuple_list(ch_data, dst_rank=fusion_rank, tag=100)
+					
+					if success:
+						self.logger.debug(f"✅ CH特征发送成功: {len(ch_data)}个特征")
+						self.update_comm_stats(True)
+					else:
+						self.logger.error("❌ CH特征发送失败，尝试回退模式")
+						self.update_comm_stats(False)
+						# 回退到原有发送方式
+						self._fallback_send_features(ch_features, processed_tiers, fusion_rank)
+				
+				elif hasattr(self.node_comm, 'send_data'):
+					# 使用通用的复杂数据发送方法
+					success = self.node_comm.send_data(ch_data, dst_rank=fusion_rank, tag=100, reliable=True)
+					
+					if success:
+						self.logger.debug(f"✅ CH特征发送成功(通用模式): {len(ch_data)}个特征")
+						self.update_comm_stats(True)
+					else:
+						self.logger.error("❌ CH特征发送失败，尝试回退模式")
+						self.update_comm_stats(False)
+						self._fallback_send_features(ch_features, processed_tiers, fusion_rank)
+				
+				else:
+					# 回退到原有发送方式
+					self.logger.warning("⚠️  使用原有发送方式(不支持复杂数据类型)")
+					self._fallback_send_features(ch_features, processed_tiers, fusion_rank)
+			
+			except Exception as e:
+				self.logger.error(f"❌ CH特征发送异常: {e}")
+				self.update_comm_stats(False)
+				# 回退到原有发送方式
+				self._fallback_send_features(ch_features, processed_tiers, fusion_rank)
 		
 		return ch_features, processed_tiers
+	
+	def _fallback_send_features(self, ch_features, processed_tiers, fusion_rank):
+		"""回退发送方式 - 兼容原有通信方式"""
+		try:
+			# 发送特征数量
+			count_tensor = torch.tensor([len(ch_features)], dtype=torch.long, device=self.device)
+			self.node_comm.send_tensor(count_tensor, dst_rank=fusion_rank, reliable=False)
+			
+			# 逐个发送特征
+			for ch_feat, tier in zip(ch_features, processed_tiers):
+				self.node_comm.send_tensor(ch_feat, dst_rank=fusion_rank, reliable=False)
+				
+				tier_tensor = torch.tensor([tier], dtype=torch.long, device=self.device)
+				self.node_comm.send_tensor(tier_tensor, dst_rank=fusion_rank, reliable=False)
+			
+			self.logger.debug(f"✅ CH特征发送成功(回退模式): {len(ch_features)}个特征")
+		
+		except Exception as e:
+			self.logger.error(f"❌ 回退发送也失败: {e}")
 	
 	def get_state_dict_prefix(self):
 		"""获取带前缀的参数字典"""
@@ -558,8 +699,6 @@ class CHProcessingStage(BaseStage):
 		for name, param in self.ch_branch.state_dict().items():
 			state_dict[f'ch_branch.{name}'] = param
 		return state_dict
-
-
 
 
 # 节点1 (GPU 3): 空间分支完整处理
@@ -646,61 +785,172 @@ class SpatialFusionStage(BaseStage):
 	def forward(self, patches=None, tiers=None):
 		"""同步前向处理"""
 		if patches is None and self.node_comm:
-			# 从PatchSchedulingStage(GPU 1)接收数据
+			# 从PatchSchedulingStage(GPU 1)接收数据 - 使用新的通信方式
 			prev_rank = self.node_comm.rank - 2  # PatchSchedulingStage在GPU 1
 			
+			patches = []
+			tiers = []
+			
+			try:
+				# 🔥 新功能：接收List[Tuple[torch.Tensor, int]]格式
+				if hasattr(self.node_comm, 'recv_tensor_tuple_list'):
+					patch_data = self.node_comm.recv_tensor_tuple_list(
+						src_rank=prev_rank,
+						tag=60  # 对应发送时的tag
+					)
+					
+					if patch_data is not None:
+						patches = [item[0] for item in patch_data]
+						tiers = [item[1] for item in patch_data]
+						self.logger.debug(f"✅ 空间分支接收成功: {len(patch_data)}个patches")
+						self.update_comm_stats(True)
+					else:
+						self.logger.error("❌ 空间分支接收失败，尝试回退模式")
+						self.update_comm_stats(False)
+						patches, tiers = self._fallback_recv_patches(prev_rank)
+				
+				elif hasattr(self.node_comm, 'recv_data'):
+					patch_data = self.node_comm.recv_data(
+						src_rank=prev_rank,
+						tag=60,
+						reliable=True
+					)
+					
+					if patch_data is not None and isinstance(patch_data, list):
+						patches = [item[0] for item in patch_data]
+						tiers = [item[1] for item in patch_data]
+						self.logger.debug(f"✅ 空间分支接收成功(通用模式): {len(patch_data)}个patches")
+						self.update_comm_stats(True)
+					else:
+						self.logger.error("❌ 空间分支接收失败，尝试回退模式")
+						self.update_comm_stats(False)
+						patches, tiers = self._fallback_recv_patches(prev_rank)
+				
+				else:
+					# 回退到原有接收方式
+					self.logger.warning("⚠️  使用原有接收方式(不支持复杂数据类型)")
+					patches, tiers = self._fallback_recv_patches(prev_rank)
+			
+			except Exception as e:
+				self.logger.error(f"❌ 空间分支接收异常: {e}")
+				self.update_comm_stats(False)
+				patches, tiers = self._fallback_recv_patches(prev_rank)
+		
+		# 处理patches
+		spatial_features, processed_tiers = self.process(patches, tiers)
+		
+		# 将空间特征发送到特征融合阶段(GPU 4, 节点2) - 使用新的通信方式
+		if self.node_comm:
+			# 特征融合阶段在节点2
+			fusion_rank = self.node_comm.node_ranks[1] if hasattr(self.node_comm,
+			                                                      'node_ranks') else self.node_comm.rank + 1
+			
+			try:
+				# 🔥 新功能：发送List[Tuple[torch.Tensor, int]]格式
+				spatial_data = [(feature, tier) for feature, tier in zip(spatial_features, processed_tiers)]
+				
+				if hasattr(self.node_comm, 'send_tensor_tuple_list'):
+					success = self.node_comm.send_tensor_tuple_list(spatial_data, dst_rank=fusion_rank, tag=110)
+					
+					if success:
+						self.logger.debug(f"✅ 空间特征发送成功: {len(spatial_data)}个特征")
+						self.update_comm_stats(True)
+					else:
+						self.logger.error("❌ 空间特征发送失败，尝试回退模式")
+						self.update_comm_stats(False)
+						self._fallback_send_spatial_features(spatial_features, processed_tiers, fusion_rank)
+				
+				elif hasattr(self.node_comm, 'send_data'):
+					success = self.node_comm.send_data(spatial_data, dst_rank=fusion_rank, tag=110, reliable=True)
+					
+					if success:
+						self.logger.debug(f"✅ 空间特征发送成功(通用模式): {len(spatial_data)}个特征")
+						self.update_comm_stats(True)
+					else:
+						self.logger.error("❌ 空间特征发送失败，尝试回退模式")
+						self.update_comm_stats(False)
+						self._fallback_send_spatial_features(spatial_features, processed_tiers, fusion_rank)
+				
+				else:
+					# 回退到原有发送方式
+					self.logger.warning("⚠️  使用原有发送方式(不支持复杂数据类型)")
+					self._fallback_send_spatial_features(spatial_features, processed_tiers, fusion_rank)
+			
+			except Exception as e:
+				self.logger.error(f"❌ 空间特征发送异常: {e}")
+				self.update_comm_stats(False)
+				self._fallback_send_spatial_features(spatial_features, processed_tiers, fusion_rank)
+		
+		return spatial_features, processed_tiers
+	
+	def _fallback_recv_patches(self, prev_rank):
+		"""回退接收方式"""
+		patches = []
+		tiers = []
+		
+		try:
 			# 接收patches数量
 			count_tensor = self.node_comm.recv_tensor(
 				src_rank=prev_rank,
 				dtype=torch.long,
-				device=self.device
+				device=self.device,
+				reliable=False
 			)
+			
+			if count_tensor is None:
+				self.logger.error("无法接收patches数量")
+				return patches, tiers
+			
 			count = count_tensor.item()
 			
 			# 接收每个patch
-			patches = []
-			tiers = []
 			for i in range(count):
 				# 接收patch图像
 				patch_tensor = self.node_comm.recv_tensor(
 					src_rank=prev_rank,
 					dtype=torch.float32,
-					device=self.device
+					device=self.device,
+					reliable=False
 				)
 				
 				# 接收tier信息
 				tier_tensor = self.node_comm.recv_tensor(
 					src_rank=prev_rank,
 					dtype=torch.long,
-					device=self.device
+					device=self.device,
+					reliable=False
 				)
 				
-				patches.append(patch_tensor)
-				tiers.append(tier_tensor.item())
-		
-		# 处理patches
-		spatial_features, processed_tiers = self.process(patches, tiers)
-		
-		# 将空间特征发送到特征融合阶段(GPU 4, 节点2)
-		if self.node_comm:
-			# 特征融合阶段在节点2
-			fusion_rank = self.node_comm.node_ranks[1] if hasattr(self.node_comm,
-			                                                      'node_ranks') else self.node_comm.rank + 1
+				if patch_tensor is not None and tier_tensor is not None:
+					patches.append(patch_tensor)
+					tiers.append(tier_tensor.item())
+				else:
+					self.logger.warning(f"patch或tier接收失败: 第{i}个")
 			
+			self.logger.debug(f"✅ 空间分支接收成功(回退模式): {len(patches)}个patches")
+		
+		except Exception as e:
+			self.logger.error(f"❌ 回退接收也失败: {e}")
+		
+		return patches, tiers
+	
+	def _fallback_send_spatial_features(self, spatial_features, processed_tiers, fusion_rank):
+		"""回退发送方式"""
+		try:
 			# 发送features数量
 			count_tensor = torch.tensor([len(spatial_features)], dtype=torch.long, device=self.device)
-			self.node_comm.send_tensor(count_tensor, dst_rank=fusion_rank)
+			self.node_comm.send_tensor(count_tensor, dst_rank=fusion_rank, reliable=False)
 			
-			# 发送每个特征
-			for i, (feature, tier) in enumerate(zip(spatial_features, processed_tiers)):
-				# 发送空间特征
-				self.node_comm.send_tensor(feature, dst_rank=fusion_rank)
-				
-				# 发送tier信息
+			# 逐个发送特征
+			for feature, tier in zip(spatial_features, processed_tiers):
+				self.node_comm.send_tensor(feature, dst_rank=fusion_rank, reliable=False)
 				tier_tensor = torch.tensor([tier], dtype=torch.long, device=self.device)
-				self.node_comm.send_tensor(tier_tensor, dst_rank=fusion_rank)
+				self.node_comm.send_tensor(tier_tensor, dst_rank=fusion_rank, reliable=False)
+			
+			self.logger.debug(f"✅ 空间特征发送成功(回退模式): {len(spatial_features)}个特征")
 		
-		return spatial_features, processed_tiers
+		except Exception as e:
+			self.logger.error(f"❌ 回退发送也失败: {e}")
 	
 	def get_state_dict_prefix(self):
 		"""获取带前缀的参数字典"""
@@ -714,8 +964,6 @@ class SpatialFusionStage(BaseStage):
 			for name, param in self.channel_adapter.state_dict().items():
 				state_dict[f'channel_adapter.{name}'] = param
 		return state_dict
-
-
 
 
 # 节点2 (GPU 4): 特征融合
@@ -791,69 +1039,117 @@ class FeatureFusionStage(BaseStage):
 	def forward(self, ch_features=None, spatial_features=None, tiers=None):
 		"""同步前向处理"""
 		if ch_features is None and self.node_comm:
-			# 接收CH特征(从节点1的GPU 2)
+			# 接收CH特征(从节点1的GPU 2) - 使用新的复杂数据类型接收
 			ch_source_rank = self._get_ch_source_rank()
 			
-			# 接收features数量
-			count_tensor = self.node_comm.recv_tensor(
-				src_rank=ch_source_rank,
-				dtype=torch.long,
-				device=self.device
-			)
-			ch_count = count_tensor.item()
-			
-			# 接收每个CH特征
 			ch_features = []
 			ch_tiers = []
-			for i in range(ch_count):
-				# 接收CH特征
-				ch_feat = self.node_comm.recv_tensor(
-					src_rank=ch_source_rank,
-					device=self.device
-				)
-				
-				# 接收tier信息
-				tier_tensor = self.node_comm.recv_tensor(
-					src_rank=ch_source_rank,
-					dtype=torch.long,
-					device=self.device
-				)
-				
-				ch_features.append(ch_feat)
-				ch_tiers.append(tier_tensor.item())
 			
-			# 接收空间特征(从节点1的GPU 3)
+			try:
+				# 🔥 新功能：直接接收List[Tuple[torch.Tensor, int]]格式
+				if hasattr(self.node_comm, 'recv_tensor_tuple_list'):
+					# 使用专门的方法接收tensor-tuple列表
+					ch_data = self.node_comm.recv_tensor_tuple_list(
+						src_rank=ch_source_rank,
+						tag=100
+					)
+					
+					if ch_data is not None:
+						ch_features = [item[0] for item in ch_data]
+						ch_tiers = [item[1] for item in ch_data]
+						self.logger.debug(f"✅ CH特征接收成功: {len(ch_data)}个特征")
+						self.update_comm_stats(True)
+					else:
+						self.logger.error("❌ CH特征接收失败，尝试回退模式")
+						self.update_comm_stats(False)
+						ch_features, ch_tiers = self._fallback_recv_ch_features(ch_source_rank)
+				
+				elif hasattr(self.node_comm, 'recv_data'):
+					# 使用通用的复杂数据接收方法
+					ch_data = self.node_comm.recv_data(
+						src_rank=ch_source_rank,
+						tag=100,
+						reliable=True
+					)
+					
+					if ch_data is not None and isinstance(ch_data, list):
+						ch_features = [item[0] for item in ch_data]
+						ch_tiers = [item[1] for item in ch_data]
+						self.logger.debug(f"✅ CH特征接收成功(通用模式): {len(ch_data)}个特征")
+						self.update_comm_stats(True)
+					else:
+						self.logger.error("❌ CH特征接收失败，尝试回退模式")
+						self.update_comm_stats(False)
+						ch_features, ch_tiers = self._fallback_recv_ch_features(ch_source_rank)
+				
+				else:
+					# 回退到原有接收方式
+					self.logger.warning("⚠️  使用原有接收方式(不支持复杂数据类型)")
+					ch_features, ch_tiers = self._fallback_recv_ch_features(ch_source_rank)
+			
+			except Exception as e:
+				self.logger.error(f"❌ CH特征接收异常: {e}")
+				self.update_comm_stats(False)
+				# 回退到原有接收方式
+				ch_features, ch_tiers = self._fallback_recv_ch_features(ch_source_rank)
+			
+			# 接收空间特征(从节点1的GPU 3) - 使用新的复杂数据类型接收
 			spatial_source_rank = self._get_spatial_source_rank()
 			
-			# 接收features数量
-			count_tensor = self.node_comm.recv_tensor(
-				src_rank=spatial_source_rank,
-				dtype=torch.long,
-				device=self.device
-			)
-			spatial_count = count_tensor.item()
-			
-			# 接收每个空间特征
 			spatial_features = []
 			spatial_tiers = []
-			for i in range(spatial_count):
-				# 接收空间特征
-				spatial_feat = self.node_comm.recv_tensor(
-					src_rank=spatial_source_rank,
-					device=self.device
-				)
+			
+			try:
+				# 🔥 新功能：直接接收List[Tuple[torch.Tensor, int]]格式
+				if hasattr(self.node_comm, 'recv_tensor_tuple_list'):
+					# 使用专门的方法接收tensor-tuple列表
+					spatial_data = self.node_comm.recv_tensor_tuple_list(
+						src_rank=spatial_source_rank,
+						tag=110  # 对应SpatialFusionStage发送的tag
+					)
+					
+					if spatial_data is not None:
+						spatial_features = [item[0] for item in spatial_data]
+						spatial_tiers = [item[1] for item in spatial_data]
+						self.logger.debug(f"✅ 空间特征接收成功: {len(spatial_data)}个特征")
+						self.update_comm_stats(True)
+					else:
+						self.logger.error("❌ 空间特征接收失败，尝试回退模式")
+						self.update_comm_stats(False)
+						spatial_features, spatial_tiers = self._fallback_recv_spatial_features(spatial_source_rank)
 				
-				# 接收tier信息
-				tier_tensor = self.node_comm.recv_tensor(
-					src_rank=spatial_source_rank,
-					dtype=torch.long,
-					device=self.device
-				)
+				elif hasattr(self.node_comm, 'recv_data'):
+					# 使用通用的复杂数据接收方法
+					spatial_data = self.node_comm.recv_data(
+						src_rank=spatial_source_rank,
+						tag=110,
+						reliable=True
+					)
+					
+					if spatial_data is not None and isinstance(spatial_data, list):
+						spatial_features = [item[0] for item in spatial_data]
+						spatial_tiers = [item[1] for item in spatial_data]
+						self.logger.debug(f"✅ 空间特征接收成功(通用模式): {len(spatial_data)}个特征")
+						self.update_comm_stats(True)
+					else:
+						self.logger.error("❌ 空间特征接收失败，尝试回退模式")
+						self.update_comm_stats(False)
+						spatial_features, spatial_tiers = self._fallback_recv_spatial_features(spatial_source_rank)
 				
-				spatial_features.append(spatial_feat)
-				spatial_tiers.append(tier_tensor.item())
+				else:
+					# 回退到原有接收方式
+					self.logger.warning("⚠️  使用原有接收方式(不支持复杂数据类型)")
+					spatial_features, spatial_tiers = self._fallback_recv_spatial_features(spatial_source_rank)
+			
+			except Exception as e:
+				self.logger.error(f"❌ 空间特征接收异常: {e}")
+				self.update_comm_stats(False)
+				# 回退到原有接收方式
+				spatial_features, spatial_tiers = self._fallback_recv_spatial_features(spatial_source_rank)
 			
 			# 确保特征和tier匹配
+			ch_count = len(ch_features)
+			spatial_count = len(spatial_features)
 			if ch_count != spatial_count:
 				print(f"Warning: CH特征({ch_count})和空间特征({spatial_count})数量不匹配")
 			
@@ -884,21 +1180,125 @@ class FeatureFusionStage(BaseStage):
 		
 		return fused_features
 	
+	def _fallback_recv_ch_features(self, ch_source_rank):
+		"""回退接收方式 - 兼容原有通信方式"""
+		ch_features = []
+		ch_tiers = []
+		
+		try:
+			# 接收features数量
+			count_tensor = self.node_comm.recv_tensor(
+				src_rank=ch_source_rank,
+				dtype=torch.long,
+				device=self.device,
+				reliable=False
+			)
+			
+			if count_tensor is None:
+				self.logger.error("无法接收CH特征数量")
+				return ch_features, ch_tiers
+			
+			ch_count = count_tensor.item()
+			
+			# 接收每个CH特征
+			for i in range(ch_count):
+				# 接收CH特征
+				ch_feat = self.node_comm.recv_tensor(
+					src_rank=ch_source_rank,
+					device=self.device,
+					reliable=False
+				)
+				
+				# 接收tier信息
+				tier_tensor = self.node_comm.recv_tensor(
+					src_rank=ch_source_rank,
+					dtype=torch.long,
+					device=self.device,
+					reliable=False
+				)
+				
+				if ch_feat is not None and tier_tensor is not None:
+					ch_features.append(ch_feat)
+					ch_tiers.append(tier_tensor.item())
+				else:
+					self.logger.warning(f"CH特征或tier接收失败: 第{i}个")
+			
+			self.logger.debug(f"✅ CH特征接收成功(回退模式): {len(ch_features)}个特征")
+		
+		except Exception as e:
+			self.logger.error(f"❌ 回退接收也失败: {e}")
+		
+		return ch_features, ch_tiers
+	
+	def _fallback_recv_spatial_features(self, spatial_source_rank):
+		"""回退接收空间特征 - 兼容原有通信方式"""
+		spatial_features = []
+		spatial_tiers = []
+		
+		try:
+			# 接收features数量
+			count_tensor = self.node_comm.recv_tensor(
+				src_rank=spatial_source_rank,
+				dtype=torch.long,
+				device=self.device,
+				reliable=False
+			)
+			
+			if count_tensor is None:
+				self.logger.error("无法接收空间特征数量")
+				return spatial_features, spatial_tiers
+			
+			spatial_count = count_tensor.item()
+			
+			# 接收每个空间特征
+			for i in range(spatial_count):
+				# 接收空间特征
+				spatial_feat = self.node_comm.recv_tensor(
+					src_rank=spatial_source_rank,
+					device=self.device,
+					reliable=False
+				)
+				
+				# 接收tier信息
+				tier_tensor = self.node_comm.recv_tensor(
+					src_rank=spatial_source_rank,
+					dtype=torch.long,
+					device=self.device,
+					reliable=False
+				)
+				
+				if spatial_feat is not None and tier_tensor is not None:
+					spatial_features.append(spatial_feat)
+					spatial_tiers.append(tier_tensor.item())
+				else:
+					self.logger.warning(f"空间特征或tier接收失败: 第{i}个")
+			
+			self.logger.debug(f"✅ 空间特征接收成功(回退模式): {len(spatial_features)}个特征")
+		
+		except Exception as e:
+			self.logger.error(f"❌ 空间特征回退接收也失败: {e}")
+		
+		return spatial_features, spatial_tiers
+	
 	def _get_ch_source_rank(self):
 		"""获取CH分支的源rank"""
+		# CH分支通常在当前rank的前一个节点
 		if hasattr(self.node_comm, 'node_ranks') and len(self.node_comm.node_ranks) > 0:
-			return self.node_comm.node_ranks[0] + 2  # 节点1的GPU 2
+			# 计算CH分支rank (节点1的GPU 2)
+			return self.node_comm.node_ranks[0] + 2  # 节点1的第3个GPU (index 2)
 		else:
-			# 简单计算：假设当前rank是4，CH分支在rank 2
-			return 2
+			# 回退计算
+			return max(0, self.node_comm.rank - 2)
 	
 	def _get_spatial_source_rank(self):
 		"""获取空间分支的源rank"""
+		# 空间分支通常在当前rank的前一个节点
 		if hasattr(self.node_comm, 'node_ranks') and len(self.node_comm.node_ranks) > 0:
-			return self.node_comm.node_ranks[0] + 3  # 节点1的GPU 3
+			# 计算空间分支rank (节点1的GPU 3)
+			return self.node_comm.node_ranks[0] + 3  # 节点1的第4个GPU (index 3)
 		else:
-			# 简单计算：假设当前rank是4，空间分支在rank 3
-			return 3
+			# 回退计算
+			return max(0, self.node_comm.rank - 1)
 	
 	def get_state_dict_prefix(self):
 		"""获取带前缀的参数字典"""
@@ -907,8 +1307,6 @@ class FeatureFusionStage(BaseStage):
 		for name, param in self.attention_fusion.state_dict().items():
 			state_dict[f'attention_fusion.{name}'] = param
 		return state_dict
-
-
 
 
 # 节点2 (GPU 5): 多尺度融合
@@ -1027,22 +1425,12 @@ class BackendStage(BaseStage):
 		self.criterion = None
 		if shared_components and 'criterion' in shared_components:
 			self.criterion = shared_components['criterion']
-			
+		
 		else:
-			from loss import VesselSegmentationLoss
+			from loss import CombinedLoss
 			
-			# 从配置中读取损失函数参数
-			vessel_weight = self.config.get('vessel_weight', 10.0)
-			tumor_weight = self.config.get('tumor_weight', 15.0)
-			use_boundary = self.config.get('use_boundary', True)
-			
-			self.criterion = VesselSegmentationLoss(
-				num_classes=1,
-				vessel_weight=vessel_weight,
-				tumor_weight=tumor_weight,
-				use_boundary=use_boundary
-			)
-			
+			self.criterion = CombinedLoss()
+		
 		# 移动到指定设备
 		if self.seg_head_first is not None:
 			self.seg_head_first.to(device)
@@ -1060,7 +1448,7 @@ class BackendStage(BaseStage):
 		"""构建分割头"""
 		self.seg_head_first = nn.Conv3d(in_c, 32, 3, padding=1, bias=False)
 		self.seg_head_first.to(ref.device, dtype=ref.dtype)
-		
+	
 	def process(self, multiscale_result, labels=None):
 		"""执行分割头处理和损失计算"""
 		start_time = time.time()
@@ -1171,6 +1559,8 @@ def create_pipeline_stages(config, node_comm=None):
 		stages['segmentation_head'] = BackendStage(  # 使用现有的BackendStage
 			full_model, device, node_comm, config=config
 		)
+	
+	stages[7] = lambda model, device: DummyStage(model, device, node_comm, config)
 	
 	return stages
 

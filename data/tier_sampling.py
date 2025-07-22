@@ -9,7 +9,7 @@ class TierSampler:
 	"""实现三级采样策略，支持智能采样"""
 	
 	def __init__(self, tier0_size=256, tier1_size=96, tier2_size=64,
-	             max_tier1=10, max_tier2=30, logger=None):
+	             max_tier1=10, max_tier2=20, logger=None):
 		"""
 		初始化三级采样器
 
