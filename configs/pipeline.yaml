@@ -25,7 +25,7 @@ model:
     tier1_size: 96
     tier2_size: 64
     max_tier1_patches: 10
-    max_tier2_patches: 30
+    max_tier2_patches: 20
 
 
 preprocessing:

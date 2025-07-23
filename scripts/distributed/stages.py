@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
+import json  # 添加json导入
 
 
 class BaseStage(nn.Module):
@@ -44,6 +45,21 @@ class BaseStage(nn.Module):
 		# 🔥 新增：通信统计
 		self.comm_success_count = 0
 		self.comm_failure_count = 0
+		
+		# ✅ 新增：Tag计数器 - 解决tag重复使用问题
+		self._tag_counter = 1000  # 起始值，避免与其他地方冲突
+	
+	def next_tag(self, step=1):
+		"""获取下一个唯一tag"""
+		current = self._tag_counter
+		self._tag_counter += step
+		self.logger.debug(f"分配tag: {current}")  # 调试日志
+		return current
+	
+	def reset_tag_counter(self):
+		"""每个batch开始时重置tag计数器"""
+		self._tag_counter = 1000
+		self.logger.debug("重置tag计数器到1000")
 	
 	def train(self, mode=True):
 		"""设置训练模式"""
@@ -252,33 +268,40 @@ class FrontendStage(BaseStage):
 		"""同步前向处理"""
 		processed_images, labels = self.process(batch)
 		
-		# 将结果发送到下一阶段(GPU 1)
+		# ✅ 修复：使用tag计数器发送多条消息
 		if self.node_comm:
 			next_rank = self.node_comm.rank + 1
+			
+			# 重置tag计数器
+			self.reset_tag_counter()
+			
+			# 发送样本数量
 			self.node_comm.send_tensor(
 				torch.tensor([len(processed_images)], dtype=torch.long),
-				dst_rank=next_rank
+				dst_rank=next_rank,
+				tag=self.next_tag()  # ✅ 使用唯一tag
 			)
 			
 			for i, proc_img in enumerate(processed_images):
 				# 发送图像
-				self.node_comm.send_tensor(proc_img['image'], dst_rank=next_rank)
+				self.node_comm.send_tensor(proc_img['image'], dst_rank=next_rank, tag=self.next_tag())
 				# 发送肝脏掩码
-				self.node_comm.send_tensor(proc_img['liver_mask'], dst_rank=next_rank)
-				# 发送case_id (作为元数据)
+				self.node_comm.send_tensor(proc_img['liver_mask'], dst_rank=next_rank, tag=self.next_tag())
+				# 发送case_id (作为元数据) - ✅ 使用JSON而不是eval
 				meta = {'case_id': proc_img['case_id']}
-				meta_tensor = torch.tensor([ord(c) for c in str(meta)],
+				meta_str = json.dumps(meta)  # ✅ 使用json.dumps替代str()
+				meta_tensor = torch.tensor([ord(c) for c in meta_str],
 				                           dtype=torch.uint8, device=self.device)
-				self.node_comm.send_tensor(meta_tensor, dst_rank=next_rank)
+				self.node_comm.send_tensor(meta_tensor, dst_rank=next_rank, tag=self.next_tag())
 			
 			# 发送标签(如果有)
 			if labels is not None:
 				has_labels = torch.tensor([1], dtype=torch.long, device=self.device)
-				self.node_comm.send_tensor(has_labels, dst_rank=next_rank)
-				self.node_comm.send_tensor(labels, dst_rank=next_rank)
+				self.node_comm.send_tensor(has_labels, dst_rank=next_rank, tag=self.next_tag())
+				self.node_comm.send_tensor(labels, dst_rank=next_rank, tag=self.next_tag())
 			else:
 				has_labels = torch.tensor([0], dtype=torch.long, device=self.device)
-				self.node_comm.send_tensor(has_labels, dst_rank=next_rank)
+				self.node_comm.send_tensor(has_labels, dst_rank=next_rank, tag=self.next_tag())
 		
 		return processed_images, labels
 	
@@ -374,14 +397,18 @@ class PatchSchedulingStage(BaseStage):
 	def forward(self, processed_images=None, labels=None):
 		"""同步前向处理"""
 		if processed_images is None and self.node_comm:
-			# 从上一阶段(GPU 0)接收数据
+			# ✅ 修复：从上一阶段(GPU 0)接收数据时使用tag计数器
 			prev_rank = self.node_comm.rank - 1
+			
+			# 重置tag计数器
+			self.reset_tag_counter()
 			
 			# 接收样本数量
 			count_tensor = self.node_comm.recv_tensor(
 				src_rank=prev_rank,
 				dtype=torch.long,
-				device=self.device
+				device=self.device,
+				tag=self.next_tag()  # ✅ 与发送端匹配
 			)
 			count = count_tensor.item()
 			
@@ -392,24 +419,33 @@ class PatchSchedulingStage(BaseStage):
 				image = self.node_comm.recv_tensor(
 					src_rank=prev_rank,
 					dtype=torch.float32,
-					device=self.device
+					device=self.device,
+					tag=self.next_tag()  # ✅ 与发送端匹配
 				)
 				
 				# 接收肝脏掩码
 				liver_mask = self.node_comm.recv_tensor(
 					src_rank=prev_rank,
 					dtype=torch.float32,
-					device=self.device
+					device=self.device,
+					tag=self.next_tag()  # ✅ 与发送端匹配
 				)
 				
 				# 接收元数据
 				meta_tensor = self.node_comm.recv_tensor(
 					src_rank=prev_rank,
 					dtype=torch.uint8,
-					device=self.device
+					device=self.device,
+					tag=self.next_tag()  # ✅ 与发送端匹配
 				)
+				
+				# ✅ 验证接收到的数据
+				if meta_tensor is None or meta_tensor.numel() == 0:
+					self.logger.error(f"meta_tensor接收失败: 第{i}个样本")
+					continue
+				
 				meta_str = ''.join([chr(c) for c in meta_tensor.cpu().numpy()])
-				meta = eval(meta_str)  # 安全问题：实际应用中应使用更安全的序列化方法
+				meta = json.loads(meta_str)  # ✅ 使用json.loads替代eval
 				
 				processed_images.append({
 					'image': image,
@@ -421,13 +457,15 @@ class PatchSchedulingStage(BaseStage):
 			has_labels = self.node_comm.recv_tensor(
 				src_rank=prev_rank,
 				dtype=torch.long,
-				device=self.device
+				device=self.device,
+				tag=self.next_tag()  # ✅ 与发送端匹配
 			).item()
 			
 			if has_labels:
 				labels = self.node_comm.recv_tensor(
 					src_rank=prev_rank,
-					device=self.device
+					device=self.device,
+					tag=self.next_tag()  # ✅ 与发送端匹配
 				)
 			else:
 				labels = None
@@ -499,15 +537,18 @@ class PatchSchedulingStage(BaseStage):
 	                           dst_rank: int, branch_name: str) -> bool:
 		"""回退发送方式"""
 		try:
+			# ✅ 重置tag计数器
+			self.reset_tag_counter()
+			
 			# 发送patches数量
 			count_tensor = torch.tensor([len(patch_data)], dtype=torch.long, device=self.device)
-			self.node_comm.send_tensor(count_tensor, dst_rank=dst_rank, reliable=False)
+			self.node_comm.send_tensor(count_tensor, dst_rank=dst_rank, tag=self.next_tag(), reliable=False)
 			
 			# 逐个发送patches
 			for patch_tensor, tier in patch_data:
-				self.node_comm.send_tensor(patch_tensor, dst_rank=dst_rank, reliable=False)
+				self.node_comm.send_tensor(patch_tensor, dst_rank=dst_rank, tag=self.next_tag(), reliable=False)
 				tier_tensor = torch.tensor([tier], dtype=torch.long, device=self.device)
-				self.node_comm.send_tensor(tier_tensor, dst_rank=dst_rank, reliable=False)
+				self.node_comm.send_tensor(tier_tensor, dst_rank=dst_rank, tag=self.next_tag(), reliable=False)
 			
 			self.logger.debug(f"✅ {branch_name}分支发送成功(回退模式): {len(patch_data)}个patches")
 			return True
@@ -588,15 +629,25 @@ class CHProcessingStage(BaseStage):
 	def forward(self, patches=None, tiers=None):
 		"""同步前向处理 - 优化版"""
 		if patches is None and self.node_comm:
-			# 从PatchSchedulingStage接收数据
+			# ✅ 修复：从PatchSchedulingStage接收数据时使用tag计数器
 			prev_rank = self.node_comm.rank - 1
+			
+			# 重置tag计数器
+			self.reset_tag_counter()
 			
 			# 1. 接收数据包数量
 			count_tensor = self.node_comm.recv_tensor(
 				src_rank=prev_rank,
 				dtype=torch.long,
-				device=self.device
+				device=self.device,
+				tag=self.next_tag()  # ✅ 与发送端匹配
 			)
+			
+			# ✅ 验证接收到的数据
+			if count_tensor is None or count_tensor.numel() == 0:
+				self.logger.error("count_tensor接收失败")
+				return [], []
+			
 			count = count_tensor.item()
 			
 			# 2. 批量接收所有patches
@@ -608,15 +659,22 @@ class CHProcessingStage(BaseStage):
 				patch_tensor = self.node_comm.recv_tensor(
 					src_rank=prev_rank,
 					dtype=torch.float32,
-					device=self.device
+					device=self.device,
+					tag=self.next_tag()  # ✅ 与发送端匹配
 				)
 				
 				# 接收tier信息
 				tier_tensor = self.node_comm.recv_tensor(
 					src_rank=prev_rank,
 					dtype=torch.long,
-					device=self.device
+					device=self.device,
+					tag=self.next_tag()  # ✅ 与发送端匹配
 				)
+				
+				# ✅ 验证接收到的数据
+				if patch_tensor is None or tier_tensor is None:
+					self.logger.error(f"patch或tier接收失败: 第{i}个")
+					continue
 				
 				patches.append(patch_tensor)
 				tiers.append(tier_tensor.item())
@@ -676,16 +734,19 @@ class CHProcessingStage(BaseStage):
 	def _fallback_send_features(self, ch_features, processed_tiers, fusion_rank):
 		"""回退发送方式 - 兼容原有通信方式"""
 		try:
+			# ✅ 重置tag计数器
+			self.reset_tag_counter()
+			
 			# 发送特征数量
 			count_tensor = torch.tensor([len(ch_features)], dtype=torch.long, device=self.device)
-			self.node_comm.send_tensor(count_tensor, dst_rank=fusion_rank, reliable=False)
+			self.node_comm.send_tensor(count_tensor, dst_rank=fusion_rank, tag=self.next_tag(), reliable=False)
 			
 			# 逐个发送特征
 			for ch_feat, tier in zip(ch_features, processed_tiers):
-				self.node_comm.send_tensor(ch_feat, dst_rank=fusion_rank, reliable=False)
+				self.node_comm.send_tensor(ch_feat, dst_rank=fusion_rank, tag=self.next_tag(), reliable=False)
 				
 				tier_tensor = torch.tensor([tier], dtype=torch.long, device=self.device)
-				self.node_comm.send_tensor(tier_tensor, dst_rank=fusion_rank, reliable=False)
+				self.node_comm.send_tensor(tier_tensor, dst_rank=fusion_rank, tag=self.next_tag(), reliable=False)
 			
 			self.logger.debug(f"✅ CH特征发送成功(回退模式): {len(ch_features)}个特征")
 		
@@ -889,15 +950,19 @@ class SpatialFusionStage(BaseStage):
 		tiers = []
 		
 		try:
+			# ✅ 重置tag计数器
+			self.reset_tag_counter()
+			
 			# 接收patches数量
 			count_tensor = self.node_comm.recv_tensor(
 				src_rank=prev_rank,
 				dtype=torch.long,
 				device=self.device,
+				tag=self.next_tag(),  # ✅ 与发送端匹配
 				reliable=False
 			)
 			
-			if count_tensor is None:
+			if count_tensor is None or count_tensor.numel() == 0:
 				self.logger.error("无法接收patches数量")
 				return patches, tiers
 			
@@ -910,6 +975,7 @@ class SpatialFusionStage(BaseStage):
 					src_rank=prev_rank,
 					dtype=torch.float32,
 					device=self.device,
+					tag=self.next_tag(),  # ✅ 与发送端匹配
 					reliable=False
 				)
 				
@@ -918,6 +984,7 @@ class SpatialFusionStage(BaseStage):
 					src_rank=prev_rank,
 					dtype=torch.long,
 					device=self.device,
+					tag=self.next_tag(),  # ✅ 与发送端匹配
 					reliable=False
 				)
 				
@@ -937,15 +1004,18 @@ class SpatialFusionStage(BaseStage):
 	def _fallback_send_spatial_features(self, spatial_features, processed_tiers, fusion_rank):
 		"""回退发送方式"""
 		try:
+			# ✅ 重置tag计数器
+			self.reset_tag_counter()
+			
 			# 发送features数量
 			count_tensor = torch.tensor([len(spatial_features)], dtype=torch.long, device=self.device)
-			self.node_comm.send_tensor(count_tensor, dst_rank=fusion_rank, reliable=False)
+			self.node_comm.send_tensor(count_tensor, dst_rank=fusion_rank, tag=self.next_tag(), reliable=False)
 			
 			# 逐个发送特征
 			for feature, tier in zip(spatial_features, processed_tiers):
-				self.node_comm.send_tensor(feature, dst_rank=fusion_rank, reliable=False)
+				self.node_comm.send_tensor(feature, dst_rank=fusion_rank, tag=self.next_tag(), reliable=False)
 				tier_tensor = torch.tensor([tier], dtype=torch.long, device=self.device)
-				self.node_comm.send_tensor(tier_tensor, dst_rank=fusion_rank, reliable=False)
+				self.node_comm.send_tensor(tier_tensor, dst_rank=fusion_rank, tag=self.next_tag(), reliable=False)
 			
 			self.logger.debug(f"✅ 空间特征发送成功(回退模式): {len(spatial_features)}个特征")
 		
@@ -1161,22 +1231,25 @@ class FeatureFusionStage(BaseStage):
 		# 处理特征
 		fused_features = self.process(ch_features, spatial_features, tiers)
 		
-		# 将融合特征发送到多尺度融合阶段(GPU 5)
+		# ✅ 修复：将融合特征发送到多尺度融合阶段(GPU 5)时使用tag计数器
 		if self.node_comm:
 			next_rank = self.node_comm.rank + 1
 			
+			# 重置tag计数器
+			self.reset_tag_counter()
+			
 			# 发送features数量
 			count_tensor = torch.tensor([len(fused_features)], dtype=torch.long, device=self.device)
-			self.node_comm.send_tensor(count_tensor, dst_rank=next_rank)
+			self.node_comm.send_tensor(count_tensor, dst_rank=next_rank, tag=self.next_tag())
 			
 			# 发送每个融合特征
 			for fused, tier in fused_features:
 				# 发送融合特征
-				self.node_comm.send_tensor(fused, dst_rank=next_rank)
+				self.node_comm.send_tensor(fused, dst_rank=next_rank, tag=self.next_tag())
 				
 				# 发送tier信息
 				tier_tensor = torch.tensor([tier], dtype=torch.long, device=self.device)
-				self.node_comm.send_tensor(tier_tensor, dst_rank=next_rank)
+				self.node_comm.send_tensor(tier_tensor, dst_rank=next_rank, tag=self.next_tag())
 		
 		return fused_features
 	
@@ -1186,15 +1259,19 @@ class FeatureFusionStage(BaseStage):
 		ch_tiers = []
 		
 		try:
+			# ✅ 重置tag计数器
+			self.reset_tag_counter()
+			
 			# 接收features数量
 			count_tensor = self.node_comm.recv_tensor(
 				src_rank=ch_source_rank,
 				dtype=torch.long,
 				device=self.device,
+				tag=self.next_tag(),  # ✅ 与发送端匹配
 				reliable=False
 			)
 			
-			if count_tensor is None:
+			if count_tensor is None or count_tensor.numel() == 0:
 				self.logger.error("无法接收CH特征数量")
 				return ch_features, ch_tiers
 			
@@ -1206,6 +1283,7 @@ class FeatureFusionStage(BaseStage):
 				ch_feat = self.node_comm.recv_tensor(
 					src_rank=ch_source_rank,
 					device=self.device,
+					tag=self.next_tag(),  # ✅ 与发送端匹配
 					reliable=False
 				)
 				
@@ -1214,6 +1292,7 @@ class FeatureFusionStage(BaseStage):
 					src_rank=ch_source_rank,
 					dtype=torch.long,
 					device=self.device,
+					tag=self.next_tag(),  # ✅ 与发送端匹配
 					reliable=False
 				)
 				
@@ -1236,15 +1315,19 @@ class FeatureFusionStage(BaseStage):
 		spatial_tiers = []
 		
 		try:
+			# ✅ 重置tag计数器
+			self.reset_tag_counter()
+			
 			# 接收features数量
 			count_tensor = self.node_comm.recv_tensor(
 				src_rank=spatial_source_rank,
 				dtype=torch.long,
 				device=self.device,
+				tag=self.next_tag(),  # ✅ 与发送端匹配
 				reliable=False
 			)
 			
-			if count_tensor is None:
+			if count_tensor is None or count_tensor.numel() == 0:
 				self.logger.error("无法接收空间特征数量")
 				return spatial_features, spatial_tiers
 			
@@ -1256,6 +1339,7 @@ class FeatureFusionStage(BaseStage):
 				spatial_feat = self.node_comm.recv_tensor(
 					src_rank=spatial_source_rank,
 					device=self.device,
+					tag=self.next_tag(),  # ✅ 与发送端匹配
 					reliable=False
 				)
 				
@@ -1264,6 +1348,7 @@ class FeatureFusionStage(BaseStage):
 					src_rank=spatial_source_rank,
 					dtype=torch.long,
 					device=self.device,
+					tag=self.next_tag(),  # ✅ 与发送端匹配
 					reliable=False
 				)
 				
@@ -1359,15 +1444,25 @@ class MultiscaleFusionStage(BaseStage):
 	def forward(self, fused_features=None):
 		"""同步前向处理"""
 		if fused_features is None and self.node_comm:
-			# 从特征融合阶段(GPU 4)接收数据
+			# ✅ 修复：从特征融合阶段(GPU 4)接收数据时使用tag计数器
 			prev_rank = self.node_comm.rank - 1
+			
+			# 重置tag计数器
+			self.reset_tag_counter()
 			
 			# 接收features数量
 			count_tensor = self.node_comm.recv_tensor(
 				src_rank=prev_rank,
 				dtype=torch.long,
-				device=self.device
+				device=self.device,
+				tag=self.next_tag()  # ✅ 与发送端匹配
 			)
+			
+			# ✅ 验证接收到的数据
+			if count_tensor is None or count_tensor.numel() == 0:
+				self.logger.error("count_tensor接收失败")
+				return None
+			
 			count = count_tensor.item()
 			
 			# 接收每个融合特征
@@ -1376,15 +1471,22 @@ class MultiscaleFusionStage(BaseStage):
 				# 接收融合特征
 				fused = self.node_comm.recv_tensor(
 					src_rank=prev_rank,
-					device=self.device
+					device=self.device,
+					tag=self.next_tag()  # ✅ 与发送端匹配
 				)
 				
 				# 接收tier信息
 				tier_tensor = self.node_comm.recv_tensor(
 					src_rank=prev_rank,
 					dtype=torch.long,
-					device=self.device
+					device=self.device,
+					tag=self.next_tag()  # ✅ 与发送端匹配
 				)
+				
+				# ✅ 验证接收到的数据
+				if fused is None or tier_tensor is None:
+					self.logger.error(f"fused特征或tier接收失败: 第{i}个")
+					continue
 				
 				fused_features.append((fused, tier_tensor.item()))
 		
@@ -1395,8 +1497,13 @@ class MultiscaleFusionStage(BaseStage):
 		if self.node_comm and multiscale_result is not None:
 			next_rank = self.node_comm.rank + 1
 			
-			# 发送多尺度融合结果
-			self.node_comm.send_tensor(multiscale_result, dst_rank=next_rank)
+			# ⬇︎⬇︎⬇︎ ① 关键：用计数器生成唯一 tag
+			self.reset_tag_counter()  # 每个 batch 重新计数（可选，保持整洁）
+			self.node_comm.send_tensor(
+				multiscale_result,
+				dst_rank=next_rank,
+				tag=self.next_tag()  # <‑‑ 别再用默认 0
+			)
 		
 		return multiscale_result
 	
@@ -1479,13 +1586,14 @@ class BackendStage(BaseStage):
 	def forward(self, multiscale_result=None, labels=None):
 		"""同步前向处理"""
 		if multiscale_result is None and self.node_comm:
-			# 从多尺度融合阶段(GPU 5)接收数据
 			prev_rank = self.node_comm.rank - 1
 			
-			# 接收多尺度融合结果
+			# ⬇︎⬇︎⬇︎ ② 关键：与发送端保持同一计数策略
+			self.reset_tag_counter()
 			multiscale_result = self.node_comm.recv_tensor(
 				src_rank=prev_rank,
-				device=self.device
+				device=self.device,
+				tag=self.next_tag()  # ←‑ 与上面 send 使用的 tag 完全一致
 			)
 		
 		# 处理特征
@@ -1560,7 +1668,8 @@ def create_pipeline_stages(config, node_comm=None):
 			full_model, device, node_comm, config=config
 		)
 	
-	stages[7] = lambda model, device: DummyStage(model, device, node_comm, config)
+	elif rank == 7:
+		stages['dummy_stage'] = DummyStage(full_model, device, node_comm, config=config)
 	
 	return stages
 
