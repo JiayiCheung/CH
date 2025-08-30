@@ -5,14 +5,9 @@ data:
   data_dir: "/home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/imagesTr"
   label_dir: "/home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/labelsTr"
   patch_size: 64
-  samples_per_volume: 30
-  frangi_scales: [1, 2, 3, 4]
-  train_val_split: 0.8
+  samples_per_volume: 5
   random_seed: 42
-  preprocess:
-    normalize: "percentile"
-    clip_percentile: [0.5, 99.5]
-    apply_window: true
+  train_val_split: 0.8
 
 # ===========================================================================
 # 模型配置
@@ -20,47 +15,18 @@ data:
 model:
   input_channels: 1
   output_classes: 1
-  feature_channels: 16
-  max_harmonic_degree: 3
-  max_radial_degree: 4
-  max_axial_degree: 5
-  cylindrical_dims: [32, 36, 32]
-  dropout_rate: 0.0
 
 # ===========================================================================
 # 训练配置
 # ===========================================================================
 train:
-  batch_size: 8
+  batch_size: 2
   epochs: 200
   lr: 0.0001
   weight_decay: 0.00001
-  warmup_epochs: 10
   validate_every: 5
   save_every: 20
-  log_dir: "/home/bingxing2/home/scx7as9/run/CSUqx/CH/outputs/logs"
-  early_stopping:
-    enabled: true
-    patience: 20
-    min_delta: 0.001
-  gradient_clipping:
-    enabled: true
-    max_norm: 1.0
-  optimizer:
-    type: "AdamW"
-    params: {}
-  scheduler:
-    type: "cosine"
-    params: {}
-
-# ===========================================================================
-# 损失函数配置
-# ===========================================================================
-loss:
-  alpha: 0.5
-  gamma: 2.0
-  boundary_weight: 2.0
-  use_focal_loss: true
+  output_dir: "outputs"
 
 # ===========================================================================
 # 数据增强配置
@@ -71,22 +37,3 @@ aug:
   intensity_scale_range: [0.9, 1.1]
   intensity_shift_range: [-0.1, 0.1]
   gaussian_noise_std: 0.01
-  elastic_transform:
-    enabled: true
-    alpha: 1
-    sigma: 10
-  random_crop:
-    enabled: false
-    size: [48, 48, 48]
-
-# ===========================================================================
-# 推理配置
-# ===========================================================================
-inference:
-  batch_size: 4
-  overlap: 0.5
-  threshold: 0.5
-  postprocess:
-    remove_small_objects: true
-    min_size: 50
-    apply_crf: false
