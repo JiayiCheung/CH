@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -161,77 +162,192 @@ class FrangiSampler:
 class VesselSegDataset(Dataset):
 	"""
 	血管分割数据集类
-	使用Frangi采样器从CT体积中提取补丁
+	惰性加载实现，支持使用预计算的Frangi响应
 	"""
 	
-	def __init__(self, volumes, labels=None, patch_size=64, samples_per_volume=30, transform=None):
+	def __init__(self, volumes, labels=None, patch_size=64, samples_per_volume=30, transform=None,
+	             preprocessed_dir=None):
 		"""
 		初始化数据集
 
 		参数:
-			volumes: CT体积列表
-			labels: 分割标签列表(可选)
+			volumes: CT体积列表或体积文件路径列表
+			labels: 分割标签列表或标签文件路径列表(可选)
 			patch_size: 补丁大小
 			samples_per_volume: 每个体积采样的补丁数量
 			transform: 数据增强变换
+			preprocessed_dir: 包含预计算Frangi响应的目录(可选)
 		"""
-		self.volumes = volumes
-		self.labels = labels
 		self.patch_size = patch_size
 		self.samples_per_volume = samples_per_volume
 		self.transform = transform
+		self.preprocessed_dir = preprocessed_dir
 		self.sampler = FrangiSampler(patch_size=patch_size)
 		
-		# 预计算所有密度图
-		self.density_maps = []
-		for vol in volumes:
-			self.density_maps.append(self.sampler.create_vessel_density_map(vol))
+		# 检测输入类型（路径列表或已加载体积）
+		self.is_path_input = False
+		if volumes is not None and isinstance(volumes, list):
+			if len(volumes) > 0 and isinstance(volumes[0], str):
+				self.is_path_input = True
 		
-		# 生成所有采样点和补丁
-		self.all_volume_patches = []
-		self.all_label_patches = []
+		# 存储体积/标签或路径
+		self.volumes = volumes
+		self.labels = labels
 		
-		for i, vol in enumerate(volumes):
-			points = self.sampler.generate_sample_points(
-				self.density_maps[i], self.samples_per_volume)
-			
-			vol_patches = self.sampler.extract_patches(vol, points)
-			
-			if vol_patches is not None:
-				self.all_volume_patches.append(vol_patches)
-				
-				if self.labels is not None:
-					label_patches = self.sampler.extract_patches(self.labels[i], points)
-					if label_patches is not None:
-						self.all_label_patches.append(label_patches)
+		# 预计算每个体积的样本偏移
+		self._compute_sample_offsets()
 		
-		# 将补丁列表展平
-		if self.all_volume_patches:
-			self.all_volume_patches = np.vstack(self.all_volume_patches)
-			if self.labels is not None and self.all_label_patches:
-				self.all_label_patches = np.vstack(self.all_label_patches)
-		else:
-			raise ValueError("No valid patches extracted from volumes")
+		# 缓存最近使用的数据
+		self.cache = {}
+		self.max_cache_size = 3  # 只缓存最近3个体积的数据
+	
+	def _compute_sample_offsets(self):
+		"""计算每个体积的样本偏移量，用于定位特定索引"""
+		self.offsets = [0]
+		total = 0
+		for _ in range(len(self.volumes)):
+			total += self.samples_per_volume
+			self.offsets.append(total)
 	
 	def __len__(self):
-		return len(self.all_volume_patches)
+		"""数据集的总样本数"""
+		return self.offsets[-1]
+	
+	def _get_case_id(self, idx):
+		"""根据体积或路径获取案例ID"""
+		if self.is_path_input:
+			path = self.volumes[idx]
+			return os.path.splitext(os.path.splitext(os.path.basename(path))[0])[0]
+		else:
+			# 如果是实际体积，使用索引作为ID
+			return f"volume_{idx}"
+	
+	def _load_volume(self, idx):
+		"""惰性加载单个体积"""
+		if self.is_path_input:
+			# 加载文件
+			import nibabel as nib
+			volume = nib.load(self.volumes[idx]).get_fdata().astype(np.float32)
+			return volume
+		else:
+			# 直接返回已加载的体积
+			return self.volumes[idx]
+	
+	def _load_label(self, idx):
+		"""惰性加载单个标签"""
+		if self.labels is None:
+			return None
+		
+		if self.is_path_input:
+			# 加载文件
+			import nibabel as nib
+			label = nib.load(self.labels[idx]).get_fdata().astype(np.float32)
+			return label
+		else:
+			# 直接返回已加载的标签
+			return self.labels[idx]
+	
+	def _get_density_map(self, idx):
+		"""获取密度图，优先使用预计算的Frangi响应"""
+		case_id = self._get_case_id(idx)
+		
+		# 检查是否有预计算的Frangi响应
+		if self.preprocessed_dir is not None and self.is_path_input:
+			frangi_path = os.path.join(self.preprocessed_dir, f"{case_id}_frangi.npy")
+			if os.path.exists(frangi_path):
+				return np.load(frangi_path)
+		
+		# 如果没有预计算，则实时计算
+		if idx in self.cache and 'volume' in self.cache[idx]:
+			volume = self.cache[idx]['volume']
+		else:
+			volume = self._load_volume(idx)
+			if idx not in self.cache:
+				self.cache[idx] = {}
+			self.cache[idx]['volume'] = volume
+		
+		# 使用FrangiSampler计算密度图
+		return self.sampler.create_vessel_density_map(volume)
 	
 	def __getitem__(self, idx):
-		vol_patch = self.all_volume_patches[idx]
+		"""按需加载并返回单个补丁"""
+		# 确定体积索引
+		vol_idx = 0
+		while vol_idx + 1 < len(self.offsets) and self.offsets[vol_idx + 1] <= idx:
+			vol_idx += 1
 		
-		# 添加通道维度
-		vol_patch = vol_patch[np.newaxis, ...]
+		# 确定这个体积内的样本索引
+		sample_idx = idx - self.offsets[vol_idx]
 		
-		if self.labels is not None:
-			label_patch = self.all_label_patches[idx]
-			label_patch = label_patch[np.newaxis, ...]
-			
-			if self.transform:
-				vol_patch, label_patch = self.transform(vol_patch, label_patch)
-			
-			return torch.from_numpy(vol_patch).float(), torch.from_numpy(label_patch).float()
+		# 为了一致性，对每个索引使用固定的随机种子
+		np.random.seed(idx)
+		
+		# 获取或计算密度图
+		if vol_idx in self.cache and 'density_map' in self.cache[vol_idx]:
+			density_map = self.cache[vol_idx]['density_map']
 		else:
-			if self.transform:
-				vol_patch = self.transform(vol_patch)
+			density_map = self._get_density_map(vol_idx)
 			
-			return torch.from_numpy(vol_patch).float()
+			# 更新缓存
+			if vol_idx not in self.cache:
+				self.cache[vol_idx] = {}
+			self.cache[vol_idx]['density_map'] = density_map
+			
+			# 限制缓存大小
+			if len(self.cache) > self.max_cache_size:
+				oldest_key = next(iter(self.cache))
+				del self.cache[oldest_key]
+		
+		# 使用原始方法生成采样点
+		points = self.sampler.generate_sample_points(density_map, self.samples_per_volume)
+		
+		if sample_idx < len(points):
+			point = points[sample_idx]
+			
+			# 按需加载体积
+			if vol_idx in self.cache and 'volume' in self.cache[vol_idx]:
+				volume = self.cache[vol_idx]['volume']
+			else:
+				volume = self._load_volume(vol_idx)
+				if vol_idx not in self.cache:
+					self.cache[vol_idx] = {}
+				self.cache[vol_idx]['volume'] = volume
+			
+			# 提取补丁
+			half_size = self.patch_size // 2
+			z, y, x = point
+			vol_patch = volume[z - half_size:z + half_size,
+			            y - half_size:y + half_size,
+			            x - half_size:x + half_size]
+			
+			# 按需加载标签
+			if self.labels is not None:
+				if vol_idx in self.cache and 'label' in self.cache[vol_idx]:
+					label = self.cache[vol_idx]['label']
+				else:
+					label = self._load_label(vol_idx)
+					if label is not None and vol_idx in self.cache:
+						self.cache[vol_idx]['label'] = label
+				
+				label_patch = label[z - half_size:z + half_size,
+				              y - half_size:y + half_size,
+				              x - half_size:x + half_size]
+			else:
+				label_patch = None
+			
+			# 添加通道维度
+			vol_patch = vol_patch[np.newaxis, ...]
+			if label_patch is not None:
+				label_patch = label_patch[np.newaxis, ...]
+			
+			# 应用数据增强
+			if self.transform:
+				if label_patch is not None:
+					vol_patch, label_patch = self.transform(vol_patch, label_patch)
+				else:
+					vol_patch = self.transform(vol_patch)
+			
+			if label_patch is not None:
+				return torch.from_numpy(vol_patch).float(), torch.from_numpy(label_patch).float()
+			else:
+				return torch.from_numpy(vol_patch).float()

@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .ch_branch import CHBranch
+from .ch_branch.ch_branch import CHBranch
 from .spatial_branch import SpatialBranch
 from .fusion.attention_fusion import AttentionFusion
 from .spatial_branch.edge_enhancement import EdgeEnhancement

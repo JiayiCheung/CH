@@ -7,6 +7,10 @@ import yaml
 from datetime import datetime
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import argparse
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 # 导入自定义模块
 from models.vessel_segmenter import VesselSegmenter
@@ -15,41 +19,47 @@ from data.transforms import get_training_transforms, get_validation_transforms
 from visualization.visualization import save_patch_visualization
 
 
+def parse_args():
+	"""解析命令行参数"""
+	parser = argparse.ArgumentParser(description='Vessel Segmentation Training with DDP')
+	parser.add_argument('--local_rank', type=int, default=-1,
+	                    help='Local rank for distributed training')
+	parser.add_argument('--config', type=str, default='config.yaml',
+	                    help='Path to config file')
+	return parser.parse_args()
+
+
 def load_config(config_path='config.yaml'):
-    """直接从YAML文件加载配置"""
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    return config
+	"""直接从YAML文件加载配置"""
+	with open(config_path, 'r', encoding='utf-8') as f:
+		config = yaml.safe_load(f)
+	return config
 
 
-def save_config(config, output_path):
-    """保存配置到YAML文件"""
-    with open(output_path, 'w', encoding='utf-8') as f:
-        yaml.dump(config, f, default_flow_style=False)
-	    
-	    
-def load_data(config):
+
+
+
+def load_data(config, is_distributed=False, rank=0):
 	"""加载训练和验证数据"""
 	# 使用nnU-Net数据集路径
 	images_dir = config['data']['data_dir']
 	labels_dir = config['data']['label_dir']
 	
-	print(f"加载图像目录: {images_dir}")
-	print(f"加载标签目录: {labels_dir}")
-	
+	if rank == 0:
 	# 读取所有体积文件
-	volume_files = sorted([f for f in os.listdir(images_dir) if f.endswith('.nii.gz')])
-	label_files = sorted([f for f in os.listdir(labels_dir) if f.endswith('.nii.gz')])
+		volume_files = sorted([f for f in os.listdir(images_dir) if f.endswith('.nii.gz')])
+		label_files = sorted([f for f in os.listdir(labels_dir) if f.endswith('.nii.gz')])
 	
-	print(f"找到 {len(volume_files)} 个体积文件和 {len(label_files)} 个标签文件")
+	if rank == 0:
+		print(f"找到 {len(volume_files)} 个体积文件和 {len(label_files)} 个标签文件")
 	
 	# 加载体积和标签
 	volumes = []
 	labels = []
 	for vol_file, lab_file in zip(volume_files, label_files):
-		print(f"加载体积: {vol_file} 和标签: {lab_file}")
-		vol_path = os.path.join(images_dir, vol_file)
-		lab_path = os.path.join(labels_dir, lab_file)
+		if rank == 0:
+			vol_path = os.path.join(images_dir, vol_file)
+			lab_path = os.path.join(labels_dir, lab_file)
 		
 		# 使用nibabel加载NIfTI格式数据
 		vol_nii = nib.load(vol_path)
@@ -75,7 +85,8 @@ def load_data(config):
 	val_volumes = [volumes[i] for i in val_indices]
 	val_labels = [labels[i] for i in val_indices]
 	
-	print(f"训练集: {len(train_volumes)} 个样本, 验证集: {len(val_volumes)} 个样本")
+	if rank == 0:
+		print(f"训练集: {len(train_volumes)} 个样本, 验证集: {len(val_volumes)} 个样本")
 	
 	# 创建数据集
 	train_dataset = VesselSegDataset(
@@ -94,11 +105,16 @@ def load_data(config):
 		transform=get_validation_transforms()
 	)
 	
+	# 创建分布式采样器
+	train_sampler = DistributedSampler(train_dataset) if is_distributed else None
+	val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
+	
 	# 创建数据加载器
 	train_loader = DataLoader(
 		train_dataset,
 		batch_size=config['train']['batch_size'],
-		shuffle=True,
+		shuffle=(train_sampler is None),  # 如果使用sampler则不能shuffle
+		sampler=train_sampler,
 		num_workers=4,
 		pin_memory=True
 	)
@@ -107,11 +123,12 @@ def load_data(config):
 		val_dataset,
 		batch_size=config['train']['batch_size'],
 		shuffle=False,
+		sampler=val_sampler,
 		num_workers=4,
 		pin_memory=True
 	)
 	
-	return train_loader, val_loader
+	return train_loader, val_loader, train_sampler, val_sampler
 
 
 def dice_coefficient(pred, target):
@@ -135,7 +152,7 @@ def precision_score(pred, target):
 	return (true_positives + smooth) / (pred.sum() + smooth)
 
 
-def validate(model, val_loader, device, epoch, vis_dir):
+def validate(model, val_loader, device, epoch, vis_dir, rank=0):
 	"""验证函数"""
 	model.eval()
 	dice_scores = []
@@ -147,7 +164,8 @@ def validate(model, val_loader, device, epoch, vis_dir):
 	vis_interval = max(1, len(val_loader) // vis_samples)
 	
 	with torch.no_grad():
-		for i, (inputs, labels) in enumerate(tqdm(val_loader, desc=f"Validating Epoch {epoch}")):
+		for i, (inputs, labels) in enumerate(
+				tqdm(val_loader, desc=f"Validating Epoch {epoch}") if rank == 0 else val_loader):
 			inputs = inputs.to(device)
 			labels = labels.to(device)
 			
@@ -166,7 +184,7 @@ def validate(model, val_loader, device, epoch, vis_dir):
 			precision_scores.append(precision.item())
 			
 			# 选择部分样本进行可视化
-			if i % vis_interval == 0:
+			if rank == 0 and i % vis_interval == 0:
 				save_patch_visualization(
 					inputs=inputs,
 					predictions=predictions,
@@ -176,34 +194,73 @@ def validate(model, val_loader, device, epoch, vis_dir):
 					output_dir=vis_dir
 				)
 	
-	# 返回平均指标
-	return {
-		"dice": np.mean(dice_scores),
-		"sensitivity": np.mean(sensitivity_scores),
-		"precision": np.mean(precision_scores)
-	}
+	# 如果是分布式训练，需要收集所有进程的指标
+	if dist.is_available() and dist.is_initialized():
+		# 收集所有进程的结果
+		dice_tensor = torch.tensor(np.mean(dice_scores), device=device)
+		sensitivity_tensor = torch.tensor(np.mean(sensitivity_scores), device=device)
+		precision_tensor = torch.tensor(np.mean(precision_scores), device=device)
+		
+		# 聚合结果
+		dist.all_reduce(dice_tensor)
+		dist.all_reduce(sensitivity_tensor)
+		dist.all_reduce(precision_tensor)
+		
+		# 计算平均值
+		world_size = dist.get_world_size()
+		dice_tensor /= world_size
+		sensitivity_tensor /= world_size
+		precision_tensor /= world_size
+		
+		return {
+			"dice": dice_tensor.item(),
+			"sensitivity": sensitivity_tensor.item(),
+			"precision": precision_tensor.item()
+		}
+	else:
+		# 单进程训练，直接返回平均指标
+		return {
+			"dice": np.mean(dice_scores),
+			"sensitivity": np.mean(sensitivity_scores),
+			"precision": np.mean(precision_scores)
+		}
 
 
-def train(config):
-	"""训练函数"""
+def train(config, local_rank=-1):
+	"""训练函数，支持分布式训练"""
+	# 分布式初始化
+	is_distributed = local_rank != -1
+	if is_distributed:
+		torch.cuda.set_device(local_rank)
+		dist.init_process_group(backend='nccl')
+		world_size = dist.get_world_size()
+		rank = dist.get_rank()
+	else:
+		rank = 0
+		world_size = 1
+	
 	# 设置设备
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	print(f"使用设备: {device}")
+	device = torch.device("cuda", local_rank) if is_distributed else torch.device(
+		"cuda" if torch.cuda.is_available() else "cpu")
+	
+	if rank == 0:
+		print(f"使用设备: {device}, 世界大小: {world_size}")
 	
 	# 创建输出目录
 	output_dir = config['train']['output_dir']
 	timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 	save_dir = os.path.join(output_dir, f'model_{timestamp}')
 	vis_dir = os.path.join(save_dir, 'visualizations')
-	os.makedirs(save_dir, exist_ok=True)
-	os.makedirs(vis_dir, exist_ok=True)
-	print(f"输出目录: {save_dir}")
 	
-	# 保存配置
-	save_config_to_yaml(config, os.path.join(save_dir, "config.yaml"))
-	
+	if rank == 0:
+		os.makedirs(save_dir, exist_ok=True)
+		os.makedirs(vis_dir, exist_ok=True)
+		print(f"输出目录: {save_dir}")
+		
+
+
 	# 加载数据
-	train_loader, val_loader = load_data(config)
+	train_loader, val_loader, train_sampler, val_sampler = load_data(config, is_distributed, rank)
 	
 	# 初始化模型
 	model = VesselSegmenter(
@@ -211,6 +268,10 @@ def train(config):
 		out_channels=config['model']['output_classes']
 	)
 	model.to(device)
+	
+	# 如果是分布式训练，包装模型
+	if is_distributed:
+		model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 	
 	# 定义损失函数和优化器
 	criterion = torch.nn.BCELoss()
@@ -225,13 +286,20 @@ def train(config):
 	start_time = time.time()
 	
 	# 训练循环
-	print(f"开始训练，总轮数: {config['train']['epochs']}")
+	if rank == 0:
+		print(f"开始训练，总轮数: {config['train']['epochs']}")
+	
 	for epoch in range(config['train']['epochs']):
+		# 设置sampler的epoch
+		if is_distributed:
+			train_sampler.set_epoch(epoch)
+		
 		# 训练阶段
 		model.train()
 		epoch_loss = 0.0
 		
-		progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config['train']['epochs']}")
+		progress_bar = tqdm(train_loader,
+		                    desc=f"Epoch {epoch + 1}/{config['train']['epochs']}") if rank == 0 else train_loader
 		for batch_idx, (inputs, labels) in enumerate(progress_bar):
 			inputs, labels = inputs.to(device), labels.to(device)
 			
@@ -246,45 +314,77 @@ def train(config):
 			
 			# 更新进度条
 			epoch_loss += loss.item()
-			progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+			if rank == 0 and isinstance(progress_bar, tqdm):
+				progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 		
 		# 计算平均损失
-		avg_loss = epoch_loss / len(train_loader)
-		print(f"Epoch {epoch + 1}/{config['train']['epochs']} | 平均损失: {avg_loss:.4f}")
+		if rank == 0:
+			avg_loss = epoch_loss / len(train_loader)
+			print(f"Epoch {epoch + 1}/{config['train']['epochs']} | 平均损失: {avg_loss:.4f}")
 		
 		# 验证阶段 - 根据配置的频率执行
 		if (epoch + 1) % config['train']['validate_every'] == 0:
-			print(f"验证Epoch {epoch + 1}...")
-			val_metrics = validate(model, val_loader, device, epoch + 1, vis_dir)
+			if rank == 0:
+				print(f"验证Epoch {epoch + 1}...")
 			
-			print(f"验证指标 - Dice: {val_metrics['dice']:.4f}, "
-			      f"Sensitivity: {val_metrics['sensitivity']:.4f}, "
-			      f"Precision: {val_metrics['precision']:.4f}")
+			# 同步所有进程进行验证
+			if is_distributed:
+				dist.barrier()
 			
-			# 保存最佳模型
-			if val_metrics['dice'] > best_dice:
-				best_dice = val_metrics['dice']
-				torch.save(model.state_dict(), os.path.join(save_dir, "best_model.pth"))
-				print(f"保存最佳模型，Dice: {best_dice:.4f}")
+			val_metrics = validate(model, val_loader, device, epoch + 1, vis_dir, rank)
+			
+			if rank == 0:
+				print(f"验证指标 - Dice: {val_metrics['dice']:.4f}, "
+				      f"Sensitivity: {val_metrics['sensitivity']:.4f}, "
+				      f"Precision: {val_metrics['precision']:.4f}")
+				
+				# 保存最佳模型
+				if val_metrics['dice'] > best_dice:
+					best_dice = val_metrics['dice']
+					# 在分布式训练中，保存模型的state_dict
+					if is_distributed:
+						torch.save(model.module.state_dict(), os.path.join(save_dir, "best_model.pth"))
+					else:
+						torch.save(model.state_dict(), os.path.join(save_dir, "best_model.pth"))
+					print(f"保存最佳模型，Dice: {best_dice:.4f}")
 		
 		# 定期保存检查点
-		if (epoch + 1) % config['train']['save_every'] == 0:
-			torch.save(
-				model.state_dict(),
-				os.path.join(save_dir, f"checkpoint_epoch_{epoch + 1}.pth")
-			)
+		if rank == 0 and (epoch + 1) % config['train']['save_every'] == 0:
+			if is_distributed:
+				torch.save(
+					model.module.state_dict(),
+					os.path.join(save_dir, f"checkpoint_epoch_{epoch + 1}.pth")
+				)
+			else:
+				torch.save(
+					model.state_dict(),
+					os.path.join(save_dir, f"checkpoint_epoch_{epoch + 1}.pth")
+				)
 	
 	# 保存最终模型
-	torch.save(model.state_dict(), os.path.join(save_dir, "final_model.pth"))
+	if rank == 0:
+		if is_distributed:
+			torch.save(model.module.state_dict(), os.path.join(save_dir, "final_model.pth"))
+		else:
+			torch.save(model.state_dict(), os.path.join(save_dir, "final_model.pth"))
+		
+		# 训练完成，打印总时间
+		total_time = time.time() - start_time
+		print(f"训练完成! 总时间: {total_time // 3600}h {(total_time % 3600) // 60}m {total_time % 60:.2f}s")
+		print(f"最佳验证Dice: {best_dice:.4f}")
+		print(f"模型保存在: {save_dir}")
 	
-	# 训练完成，打印总时间
-	total_time = time.time() - start_time
-	print(f"训练完成! 总时间: {total_time // 3600}h {(total_time % 3600) // 60}m {total_time % 60:.2f}s")
-	print(f"最佳验证Dice: {best_dice:.4f}")
-	print(f"模型保存在: {save_dir}")
+	# 清理分布式环境
+	if is_distributed:
+		dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    # 直接从config.yaml加载配置
-    config = load_config('config.yaml')
-    train(config)
+	# 解析命令行参数
+	args = parse_args()
+	
+	# 加载配置
+	config = load_config(args.config)
+	
+	# 启动训练
+	train(config, args.local_rank)
