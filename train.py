@@ -12,11 +12,13 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-# 导入自定义模块
 from models.vessel_segmenter import VesselSegmenter
-from data.dataset import VesselSegDataset
 from data.transforms import get_training_transforms, get_validation_transforms
 from visualization.visualization import save_patch_visualization
+from utils.losses import CombinedLoss
+from models.dataload.ch_dataload import load_ch_data
+# 导入TensorBoardLogger
+from utils.tensorboard_logger import TensorBoardLogger
 
 
 def parse_args():
@@ -36,97 +38,38 @@ def load_config(config_path='config.yaml'):
 	return config
 
 
-
-
-
 def load_data(config, is_distributed=False, rank=0):
-	"""加载训练和验证数据"""
-	# 使用nnU-Net数据集路径
-	images_dir = config['data']['data_dir']
-	labels_dir = config['data']['label_dir']
+	"""加载训练和验证数据 - 修改为使用惰性加载"""
+	# 获取训练和验证数据加载器
+	train_loader, val_loader = load_ch_data(config)
 	
-	if rank == 0:
-	# 读取所有体积文件
-		volume_files = sorted([f for f in os.listdir(images_dir) if f.endswith('.nii.gz')])
-		label_files = sorted([f for f in os.listdir(labels_dir) if f.endswith('.nii.gz')])
+	# 创建分布式采样器（如果需要）
+	train_sampler = None
+	val_sampler = None
 	
-	if rank == 0:
-		print(f"找到 {len(volume_files)} 个体积文件和 {len(label_files)} 个标签文件")
-	
-	# 加载体积和标签
-	volumes = []
-	labels = []
-	for vol_file, lab_file in zip(volume_files, label_files):
-		if rank == 0:
-			vol_path = os.path.join(images_dir, vol_file)
-			lab_path = os.path.join(labels_dir, lab_file)
+	if is_distributed:
+		# 重新创建分布式采样器
+		train_sampler = DistributedSampler(train_loader.dataset)
+		val_sampler = DistributedSampler(val_loader.dataset, shuffle=False)
 		
-		# 使用nibabel加载NIfTI格式数据
-		vol_nii = nib.load(vol_path)
-		lab_nii = nib.load(lab_path)
+		# 使用分布式采样器重新创建加载器
+		train_loader = DataLoader(
+			train_loader.dataset,
+			batch_size=config['train']['batch_size'],
+			shuffle=False,
+			sampler=train_sampler,
+			num_workers=1,
+			pin_memory=True
+		)
 		
-		vol_data = vol_nii.get_fdata().astype(np.float32)
-		lab_data = lab_nii.get_fdata().astype(np.float32)
-		
-		volumes.append(vol_data)
-		labels.append(lab_data)
-	
-	# 划分训练集和验证集
-	num_samples = len(volumes)
-	np.random.seed(config['data']['random_seed'])  # 固定随机种子，确保可重现性
-	indices = np.random.permutation(num_samples)
-	split_idx = int(num_samples * config['data']['train_val_split'])  # 默认80%用于训练
-	
-	train_indices = indices[:split_idx]
-	val_indices = indices[split_idx:]
-	
-	train_volumes = [volumes[i] for i in train_indices]
-	train_labels = [labels[i] for i in train_indices]
-	val_volumes = [volumes[i] for i in val_indices]
-	val_labels = [labels[i] for i in val_indices]
-	
-	if rank == 0:
-		print(f"训练集: {len(train_volumes)} 个样本, 验证集: {len(val_volumes)} 个样本")
-	
-	# 创建数据集
-	train_dataset = VesselSegDataset(
-		volumes=train_volumes,
-		labels=train_labels,
-		patch_size=config['data']['patch_size'],
-		samples_per_volume=config['data']['samples_per_volume'],
-		transform=get_training_transforms(config['aug'])
-	)
-	
-	val_dataset = VesselSegDataset(
-		volumes=val_volumes,
-		labels=val_labels,
-		patch_size=config['data']['patch_size'],
-		samples_per_volume=config['data']['samples_per_volume'],
-		transform=get_validation_transforms()
-	)
-	
-	# 创建分布式采样器
-	train_sampler = DistributedSampler(train_dataset) if is_distributed else None
-	val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
-	
-	# 创建数据加载器
-	train_loader = DataLoader(
-		train_dataset,
-		batch_size=config['train']['batch_size'],
-		shuffle=(train_sampler is None),  # 如果使用sampler则不能shuffle
-		sampler=train_sampler,
-		num_workers=4,
-		pin_memory=True
-	)
-	
-	val_loader = DataLoader(
-		val_dataset,
-		batch_size=config['train']['batch_size'],
-		shuffle=False,
-		sampler=val_sampler,
-		num_workers=4,
-		pin_memory=True
-	)
+		val_loader = DataLoader(
+			val_loader.dataset,
+			batch_size=config['train']['batch_size'],
+			shuffle=False,
+			sampler=val_sampler,
+			num_workers=1,
+			pin_memory=True
+		)
 	
 	return train_loader, val_loader, train_sampler, val_sampler
 
@@ -256,10 +199,8 @@ def train(config, local_rank=-1):
 		os.makedirs(save_dir, exist_ok=True)
 		os.makedirs(vis_dir, exist_ok=True)
 		print(f"输出目录: {save_dir}")
-		
-
-
-	# 加载数据
+	
+	# 加载数据 - 使用修改后的load_data函数
 	train_loader, val_loader, train_sampler, val_sampler = load_data(config, is_distributed, rank)
 	
 	# 初始化模型
@@ -274,12 +215,17 @@ def train(config, local_rank=-1):
 		model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 	
 	# 定义损失函数和优化器
-	criterion = torch.nn.BCELoss()
+	criterion = CombinedLoss(alpha=0.5, gamma=2.0)
 	optimizer = torch.optim.Adam(
 		model.parameters(),
 		lr=config['train']['lr'],
 		weight_decay=config['train']['weight_decay']
 	)
+	
+	# 创建TensorBoard记录器
+	if rank == 0:
+		tb_dir = os.path.join(save_dir, "tensorboard")
+		logger = TensorBoardLogger(tb_dir, config, model if not is_distributed else model.module, rank)
 	
 	# 训练跟踪
 	best_dice = 0.0
@@ -321,6 +267,20 @@ def train(config, local_rank=-1):
 		if rank == 0:
 			avg_loss = epoch_loss / len(train_loader)
 			print(f"Epoch {epoch + 1}/{config['train']['epochs']} | 平均损失: {avg_loss:.4f}")
+			
+			# 记录训练损失
+			logger.log_epoch(
+				epoch,
+				avg_loss,
+				optimizer.param_groups[0]['lr']
+			)
+			
+			# 每5个epoch记录权重和梯度
+			if epoch % 5 == 0:
+				if is_distributed:
+					logger.log_weights_and_gradients(epoch, model.module)
+				else:
+					logger.log_weights_and_gradients(epoch, model)
 		
 		# 验证阶段 - 根据配置的频率执行
 		if (epoch + 1) % config['train']['validate_every'] == 0:
@@ -338,6 +298,23 @@ def train(config, local_rank=-1):
 				      f"Sensitivity: {val_metrics['sensitivity']:.4f}, "
 				      f"Precision: {val_metrics['precision']:.4f}")
 				
+				# 记录验证指标
+				logger.log_epoch(
+					epoch,
+					avg_loss,
+					optimizer.param_groups[0]['lr'],
+					val_metrics
+				)
+				
+				# 记录验证样本
+				if len(val_loader) > 0:
+					sample_data = next(iter(val_loader))
+					sample_inputs, sample_labels = sample_data[0].to(device), sample_data[1].to(device)
+					with torch.no_grad():
+						sample_outputs = model(sample_inputs)
+						sample_preds = (sample_outputs > 0.5).float()
+					logger.log_validation_samples(epoch, sample_inputs, sample_labels, sample_preds)
+				
 				# 保存最佳模型
 				if val_metrics['dice'] > best_dice:
 					best_dice = val_metrics['dice']
@@ -347,6 +324,9 @@ def train(config, local_rank=-1):
 					else:
 						torch.save(model.state_dict(), os.path.join(save_dir, "best_model.pth"))
 					print(f"保存最佳模型，Dice: {best_dice:.4f}")
+					
+					# 记录最佳模型信息
+					logger.log_best_model(epoch, val_metrics)
 		
 		# 定期保存检查点
 		if rank == 0 and (epoch + 1) % config['train']['save_every'] == 0:
@@ -373,6 +353,10 @@ def train(config, local_rank=-1):
 		print(f"训练完成! 总时间: {total_time // 3600}h {(total_time % 3600) // 60}m {total_time % 60:.2f}s")
 		print(f"最佳验证Dice: {best_dice:.4f}")
 		print(f"模型保存在: {save_dir}")
+		
+		# 记录训练结束信息
+		best_metrics = {"dice": best_dice}
+		logger.finish_logging(best_metrics, val_metrics)
 	
 	# 清理分布式环境
 	if is_distributed:

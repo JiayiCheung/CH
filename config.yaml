@@ -4,6 +4,7 @@
 data:
   data_dir: "/home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/imagesTr"
   label_dir: "/home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/labelsTr"
+  preprocessed_dir: "/home/bingxing2/home/scx7as9/run/CSUqx/CH/data/frangi"
   patch_size: 64
   samples_per_volume: 3
   random_seed: 42
