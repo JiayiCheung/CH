@@ -3,7 +3,7 @@
 # ===========================================================================
 data:
   data_dir: "/home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/imagesTr"
-  label_dir: "/home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/labelsTr"
+  label_dir:  "/home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/labelsTr"
   preprocessed_dir: "/home/bingxing2/home/scx7as9/run/CSUqx/CH/data/frangi"
   patch_size: 64
   samples_per_volume: 3
@@ -16,7 +16,6 @@ data:
 model:
   input_channels: 1
   output_classes: 1
-
 # ===========================================================================
 # 训练配置
 # ===========================================================================
