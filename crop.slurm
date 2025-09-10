@@ -3,7 +3,7 @@
 #SBATCH --output=Vessel_Preprocessing_%j.out
 #SBATCH --error=Vessel_Preprocessing_%j.err
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --ntasks=2
 #SBATCH --cpus-per-task=32
 #SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
@@ -17,9 +17,11 @@ cd /home/bingxing2/home/scx7as9/run/CSUqx/CH
 # 创建预处理输出目录
 mkdir -p data/preprocess
 
-# 运行预处理脚本
-python -m data.preprocess \
-  --cropped_dir /home/bingxing2/home/scx7as9/run/CSUqx/CH/data/preprocess/cropped \
+
+
+
+python -m data.crop \
+  --images_dir /home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/imagesTr \
+  --labels_dir /home/bingxing2/home/scx7as9/run/CSUqx/DataBase/Task08_HepaticVessel/labelsTr \
   --output_dir /home/bingxing2/home/scx7as9/run/CSUqx/CH/data/preprocess \
-  --target_spacing 1.0 1.0 1.0 \
-  --num_workers 8
+  --num_workers 4
