@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#/CH/models/vessel_segmenter.py
 """
 血管分割模型
 """
@@ -283,4 +283,5 @@ class VesselSegmenter(nn.Module):
 			'additional_info': checkpoint.get('additional_info'),
 		}
 		
+
 		return model, checkpoint_info
